@@ -1,4 +1,97 @@
 #[test]
+fn writes_pdf_metadata() {
+    let pdf = html2pdf_rs::render_html(
+        "<title>Judul Dokumen</title>\
+         <meta name=\"author\" content=\"Budi\">\
+         <meta name=\"description\" content=\"Ringkasan\">\
+         <p>Isi</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/Title (Judul Dokumen)"));
+    assert!(raw.contains("/Author (Budi)"));
+    assert!(raw.contains("/Subject (Ringkasan)"));
+}
+
+#[test]
+fn loads_external_css_and_imports() {
+    use std::fs;
+
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-css-{}", std::process::id()));
+    let css_directory = directory.join("css");
+    fs::create_dir_all(&css_directory).unwrap();
+    fs::write(
+        css_directory.join("main.css"),
+        "@import url('import.css'); p { color: green; }",
+    )
+    .unwrap();
+    fs::write(css_directory.join("import.css"), "h1 { color: red; }").unwrap();
+
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<link rel=\"stylesheet\" href=\"css/main.css\"><h1>Judul</h1><p>Paragraf</p>",
+        &directory,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    fs::remove_dir_all(&directory).unwrap();
+
+    assert!(raw.contains("Judul"));
+    assert!(raw.contains("Paragraf"));
+    assert!(raw.contains("1 0 0 rg"));
+    assert!(raw.contains("0 0.5 0 rg"));
+}
+
+#[test]
+fn applies_page_at_rule() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: letter landscape; margin: 1cm; }</style><p>Halaman</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("792 612"));
+}
+
+#[test]
+fn resolves_base_href_and_image_link() {
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+    use std::fs;
+
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-base-{}", std::process::id()));
+    let sub = directory.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+
+    let mut png = Vec::new();
+    let pixels = [0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    fs::write(sub.join("g.png"), &png).unwrap();
+
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<base href=\"sub/\"><a href=\"next.html\"><img src=\"g.png\" width=\"30\"></a>",
+        &directory,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    fs::remove_dir_all(&directory).unwrap();
+
+    assert!(raw.contains("/Subtype /Image"));
+    assert!(raw.contains("Im1 Do"));
+    assert!(raw.contains("/Subtype /Link"));
+    assert!(raw.contains("next.html"));
+}
+
+#[test]
+fn applies_page_options() {
+    use html2pdf_rs::Options;
+    use std::path::Path;
+
+    let options = Options::paper("letter").unwrap().landscape().margin(20.0);
+    let pdf = html2pdf_rs::render_html_with_options("<p>Halaman</p>", Path::new("."), &options);
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("792 612"));
+}
+
+#[test]
 fn paginates_long_content() {
     let html = "<p>Baris</p>".repeat(80);
     let pdf = html2pdf_rs::render_html(&html);

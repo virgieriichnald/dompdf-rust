@@ -1,7 +1,7 @@
 use pdf_writer::types::{
     ActionType, AnnotationType, CidFontType, FontFlags, SystemInfo, UnicodeCmap,
 };
-use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str};
+use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
 use crate::css::TextAlign;
 use crate::layout::{Document, FontId, InlineItem, Page, measure};
@@ -36,8 +36,27 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         })
         .collect::<Vec<_>>();
     let mut next_id = font_base_id + document.fonts.len() as i32 * 5;
+    let info_id = Ref::new(next_id);
+    next_id += 1;
 
     pdf.catalog(catalog_id).pages(pages_id);
+
+    let mut info = pdf.document_info(info_id);
+    info.creator(TextStr("html2pdf-rs"))
+        .producer(TextStr("html2pdf-rs"));
+    if let Some(title) = &document.metadata.title {
+        info.title(TextStr(title));
+    }
+    if let Some(author) = &document.metadata.author {
+        info.author(TextStr(author));
+    }
+    if let Some(subject) = &document.metadata.subject {
+        info.subject(TextStr(subject));
+    }
+    if let Some(keywords) = &document.metadata.keywords {
+        info.keywords(TextStr(keywords));
+    }
+    info.finish();
 
     for (&id, base) in font_ids.iter().zip([
         b"Helvetica".as_slice(),

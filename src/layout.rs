@@ -6,14 +6,11 @@ use base64::Engine;
 use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
+use crate::Options;
 use crate::css::{
-    BorderSpec, Display, FontFace, Rule, Style, TextAlign, parse_font_faces, parse_styles,
-    style_for,
+    BorderSpec, Display, FontFace, Rule, Style, TextAlign, parse_font_faces, parse_page_rules,
+    parse_styles, style_for,
 };
-
-const PAGE_WIDTH: f32 = 595.28;
-const PAGE_HEIGHT: f32 = 841.89;
-const PAGE_MARGIN: f32 = 54.0;
 
 const HELVETICA_WIDTHS: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
@@ -72,6 +69,7 @@ pub struct ImageItem {
     pub image: usize,
     pub width: f32,
     pub height: f32,
+    pub link: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,11 +124,20 @@ pub struct EmbeddedFont {
     pub descent: f32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Metadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     pub pages: Vec<Page>,
     pub images: Vec<ImageAsset>,
     pub fonts: Vec<EmbeddedFont>,
+    pub metadata: Metadata,
     pub width: f32,
     pub height: f32,
     pub margin: f32,
@@ -142,14 +149,31 @@ impl Document {
     }
 
     pub fn from_html_with_base(html: &str, base: &Path) -> Self {
+        Self::from_html_with_options(html, base, &Options::default())
+    }
+
+    pub fn from_html_with_options(html: &str, base: &Path, options: &Options) -> Self {
         let parsed = Html::parse_document(html);
-        let rules = parse_styles(&parsed);
-        let font_faces = parse_font_faces(&parsed);
+        let base = resolve_base(&parsed, base);
+        let rules = parse_styles(&parsed, &base);
+        let font_faces = parse_font_faces(&parsed, &base);
+        let metadata = parse_metadata(&parsed);
+        let mut options = options.clone();
+        let page = parse_page_rules(&parsed, &base);
+        if let Some(width) = page.width {
+            options.width = width;
+        }
+        if let Some(height) = page.height {
+            options.height = height;
+        }
+        if let Some(margin) = page.margin {
+            options.margin = margin;
+        }
         let base_style = Style::default();
         let mut collector = Collector::new(
-            PAGE_WIDTH - 2.0 * PAGE_MARGIN,
-            PAGE_HEIGHT - 2.0 * PAGE_MARGIN,
-            base,
+            options.width - 2.0 * options.margin,
+            options.height - 2.0 * options.margin,
+            &base,
         );
 
         collector.load_fonts(&font_faces);
@@ -160,11 +184,89 @@ impl Document {
             pages: collector.pages,
             images: collector.images,
             fonts: collector.fonts,
-            width: PAGE_WIDTH,
-            height: PAGE_HEIGHT,
-            margin: PAGE_MARGIN,
+            metadata,
+            width: options.width,
+            height: options.height,
+            margin: options.margin,
         }
     }
+}
+
+fn resolve_base(html: &Html, base: &Path) -> PathBuf {
+    let selector = Selector::parse("base[href]").expect("valid selector");
+    let Some(element) = html.select(&selector).next() else {
+        return base.to_path_buf();
+    };
+    let Some(href) = element.value().attr("href") else {
+        return base.to_path_buf();
+    };
+    if href.starts_with("data:")
+        || href.starts_with("http://")
+        || href.starts_with("https://")
+        || href.starts_with("//")
+    {
+        return base.to_path_buf();
+    }
+
+    let joined = base.join(href);
+    if href.ends_with('/') {
+        joined
+    } else {
+        joined
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base.to_path_buf())
+    }
+}
+
+fn parse_metadata(html: &Html) -> Metadata {
+    let title_selector = Selector::parse("title").expect("valid selector");
+    let meta_selector = Selector::parse("meta[name]").expect("valid selector");
+    let mut metadata = Metadata::default();
+
+    if let Some(element) = html.select(&title_selector).next() {
+        let title = element.text().collect::<String>().trim().to_string();
+        if !title.is_empty() {
+            metadata.title = Some(title);
+        }
+    }
+
+    for element in html.select(&meta_selector) {
+        let value = element.value();
+        let Some(name) = value.attr("name") else {
+            continue;
+        };
+        let Some(content) = value.attr("content") else {
+            continue;
+        };
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        match name.to_ascii_lowercase().as_str() {
+            "author" => metadata.author = Some(content.to_string()),
+            "description" => metadata.subject = Some(content.to_string()),
+            "keywords" => metadata.keywords = Some(content.to_string()),
+            _ => {}
+        }
+    }
+
+    metadata
+}
+
+fn resolve_uri(href: &str, base: &Path) -> String {
+    if href.starts_with('#')
+        || href.starts_with("data:")
+        || href.starts_with("http://")
+        || href.starts_with("https://")
+        || href.starts_with("mailto:")
+        || href.starts_with("tel:")
+        || href.starts_with("//")
+    {
+        return href.to_string();
+    }
+    base.join(href).to_string_lossy().into_owned()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -441,6 +543,7 @@ impl Collector {
             image: index,
             width,
             height,
+            link: self.link.clone(),
         }));
         self.width += width;
         self.height = self
@@ -453,7 +556,7 @@ impl Collector {
         for face in faces {
             let key = face.family.to_ascii_lowercase();
             if !self.font_cache.contains_key(&key) {
-                let loaded = read_resource(&face.src, &self.base)
+                let loaded = read_resource(&face.src, &face.base)
                     .and_then(|bytes| load_font(&face.family, &bytes))
                     .map(|font| {
                         self.fonts.push(font);
@@ -539,15 +642,15 @@ fn collect_links(items: &[InlineItem], fonts: &[EmbeddedFont]) -> Vec<LinkRect> 
     let mut active: Option<(String, f32, f32)> = None;
 
     for item in items {
-        let InlineItem::Text(run) = item else {
-            if let Some((uri, x, width)) = active.take() {
-                links.push(LinkRect { x, width, uri });
-            }
-            continue;
+        let (width, link) = match item {
+            InlineItem::Text(run) => (
+                measure(&run.text, run.size, run.font, fonts),
+                run.link.as_ref(),
+            ),
+            InlineItem::Image(image) => (image.width, image.link.as_ref()),
         };
 
-        let width = measure(&run.text, run.size, run.font, fonts);
-        match (&run.link, active.as_mut()) {
+        match (link, active.as_mut()) {
             (Some(uri), Some((current_uri, _, current_width))) if uri == current_uri => {
                 *current_width += width;
             }
@@ -614,7 +717,9 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
 
     let previous_link = collector.link.clone();
     if tag == "a" {
-        collector.link = element.attr("href").map(str::to_string);
+        collector.link = element
+            .attr("href")
+            .map(|href| resolve_uri(href, &collector.base));
     }
 
     if tag == "br" {

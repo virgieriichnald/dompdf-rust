@@ -1,3 +1,7 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use base64::Engine;
 use scraper::{ElementRef, Selector};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +45,14 @@ impl BorderSpec {
 pub struct FontFace {
     pub family: String,
     pub src: String,
+    pub base: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PageRule {
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub margin: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +66,9 @@ pub enum Unit {
     Pt,
     Px,
     Em,
+    In,
+    Cm,
+    Mm,
     Percent,
 }
 
@@ -72,6 +87,9 @@ impl Length {
             Unit::Pt => self.value,
             Unit::Px => self.value * 0.75,
             Unit::Em => self.value * font_size,
+            Unit::In => self.value * 72.0,
+            Unit::Cm => self.value * 72.0 / 2.54,
+            Unit::Mm => self.value * 72.0 / 25.4,
             Unit::Percent => 0.0,
         }
     }
@@ -181,57 +199,251 @@ pub struct Rule {
     pub order: usize,
 }
 
-pub fn parse_styles(html: &scraper::Html) -> Vec<Rule> {
-    let selector = Selector::parse("style").expect("valid selector");
+pub fn parse_styles(html: &scraper::Html, base: &Path) -> Vec<Rule> {
+    let sheets = stylesheets(html, base);
     let mut rules = Vec::new();
     let mut order = 0usize;
 
-    for element in html.select(&selector) {
-        let text = element.text().collect::<String>();
-        for rule in parse_css(&text, &mut order) {
-            rules.push(rule);
-        }
+    for (text, _) in &sheets {
+        rules.extend(parse_css(text, &mut order));
     }
 
     rules
 }
 
-pub fn parse_font_faces(html: &scraper::Html) -> Vec<FontFace> {
-    let selector = Selector::parse("style").expect("valid selector");
+pub fn parse_font_faces(html: &scraper::Html, base: &Path) -> Vec<FontFace> {
+    let sheets = stylesheets(html, base);
     let mut faces = Vec::new();
 
-    for element in html.select(&selector) {
-        let text = strip_comments(&element.text().collect::<String>());
-        let mut rest = text.as_str();
+    for (text, sheet_base) in &sheets {
+        faces.extend(parse_font_faces_css(text, sheet_base));
+    }
 
-        while let Some(position) = rest.find("@font-face") {
-            let after = &rest[position + "@font-face".len()..];
+    faces
+}
+
+pub fn parse_page_rules(html: &scraper::Html, base: &Path) -> PageRule {
+    let sheets = stylesheets(html, base);
+    let mut page = PageRule::default();
+
+    for (text, _) in &sheets {
+        let clean = strip_comments(text);
+        let mut rest = clean.as_str();
+
+        while let Some(position) = rest.find("@page") {
+            let after = &rest[position + "@page".len()..];
             let Some(open) = after.find('{') else {
                 break;
             };
+            let selector = after[..open].trim();
             let after_open = &after[open + 1..];
             let Some(close) = after_open.find('}') else {
                 break;
             };
-            let declarations = parse_declarations(&after_open[..close]);
             rest = &after_open[close + 1..];
 
-            let family = declarations
-                .iter()
-                .find(|(property, _)| property == "font-family")
-                .and_then(|(_, value)| clean_family(value));
-            let source = declarations
-                .iter()
-                .find(|(property, _)| property == "src")
-                .and_then(|(_, value)| extract_url(value));
+            if !selector.is_empty() {
+                continue;
+            }
 
-            if let (Some(family), Some(src)) = (family, source) {
-                faces.push(FontFace { family, src });
+            for (property, value) in parse_declarations(&after_open[..close]) {
+                match property.as_str() {
+                    "size" => {
+                        let (dimensions, landscape) = parse_page_size(&value);
+                        if let Some((mut width, mut height)) = dimensions {
+                            if landscape {
+                                std::mem::swap(&mut width, &mut height);
+                            }
+                            page.width = Some(width);
+                            page.height = Some(height);
+                        }
+                    }
+                    "margin" => {
+                        if let Some(length) = parse_length(&value) {
+                            page.margin = Some(length.resolve(12.0));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
 
+    page
+}
+
+fn parse_page_size(value: &str) -> (Option<(f32, f32)>, bool) {
+    let mut named = None;
+    let mut width = None;
+    let mut height = None;
+    let mut landscape = false;
+
+    for token in value.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        match lower.as_str() {
+            "landscape" => landscape = true,
+            "portrait" => {}
+            _ => {
+                if let Some(size) = paper_size(&lower) {
+                    named = Some(size);
+                } else if let Some(length) = parse_length(token) {
+                    let points = length.resolve(12.0);
+                    if width.is_none() {
+                        width = Some(points);
+                    } else {
+                        height = Some(points);
+                    }
+                }
+            }
+        }
+    }
+
+    let dimensions = match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        (Some(width), None) => Some((width, width)),
+        (None, None) => named,
+        (None, Some(height)) => Some((height, height)),
+    };
+
+    (dimensions, landscape)
+}
+
+fn paper_size(name: &str) -> Option<(f32, f32)> {
+    match name {
+        "a4" => Some((595.28, 841.89)),
+        "letter" => Some((612.0, 792.0)),
+        "legal" => Some((612.0, 1008.0)),
+        "a3" => Some((841.89, 1190.55)),
+        _ => None,
+    }
+}
+
+fn stylesheets(html: &scraper::Html, base: &Path) -> Vec<(String, PathBuf)> {
+    let selector = Selector::parse("style, link").expect("valid selector");
+    let mut raw = Vec::new();
+
+    for element in html.select(&selector) {
+        let value = element.value();
+        match value.name() {
+            "style" => raw.push((element.text().collect::<String>(), base.to_path_buf())),
+            "link" => {
+                let is_stylesheet = value.attr("rel").is_some_and(|rel| {
+                    rel.split_whitespace()
+                        .any(|item| item.eq_ignore_ascii_case("stylesheet"))
+                });
+                let Some(href) = value.attr("href") else {
+                    continue;
+                };
+                if !is_stylesheet {
+                    continue;
+                }
+                if let Some(text) = read_text_resource(href, base) {
+                    raw.push((text, resource_base(href, base)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut expanded = Vec::new();
+    for (text, sheet_base) in raw {
+        expand_css(&text, &sheet_base, &mut expanded);
+    }
+    expanded
+}
+
+fn expand_css(input: &str, base: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let clean = strip_comments(input);
+    let mut segments = Vec::new();
+    let mut imports = Vec::new();
+    let mut rest = clean.as_str();
+
+    while let Some(position) = rest.find("@import") {
+        segments.push((rest[..position].to_string(), base.to_path_buf()));
+        let after = &rest[position + "@import".len()..];
+        let Some(semicolon) = after.find(';') else {
+            rest = &rest[position..];
+            break;
+        };
+        let statement = &after[..semicolon];
+        if let Some(url) = extract_url(statement)
+            && let Some(text) = read_text_resource(&url, base)
+        {
+            imports.push((text, resource_base(&url, base)));
+        }
+        rest = &after[semicolon + 1..];
+    }
+    segments.push((rest.to_string(), base.to_path_buf()));
+
+    for (index, (text, segment_base)) in segments.into_iter().enumerate() {
+        if !text.trim().is_empty() {
+            out.push((text, segment_base));
+        }
+        if let Some((import, import_base)) = imports.get(index) {
+            expand_css(import, import_base, out);
+        }
+    }
+}
+
+fn parse_font_faces_css(input: &str, base: &Path) -> Vec<FontFace> {
+    let text = strip_comments(input);
+    let mut faces = Vec::new();
+    let mut rest = text.as_str();
+
+    while let Some(position) = rest.find("@font-face") {
+        let after = &rest[position + "@font-face".len()..];
+        let Some(open) = after.find('{') else {
+            break;
+        };
+        let after_open = &after[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        let declarations = parse_declarations(&after_open[..close]);
+        rest = &after_open[close + 1..];
+
+        let family = declarations
+            .iter()
+            .find(|(property, _)| property == "font-family")
+            .and_then(|(_, value)| clean_family(value));
+        let source = declarations
+            .iter()
+            .find(|(property, _)| property == "src")
+            .and_then(|(_, value)| extract_url(value));
+
+        if let (Some(family), Some(src)) = (family, source) {
+            faces.push(FontFace {
+                family,
+                src,
+                base: base.to_path_buf(),
+            });
+        }
+    }
+
     faces
+}
+
+fn read_text_resource(src: &str, base: &Path) -> Option<String> {
+    if let Some(position) = src.find(";base64,") {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&src[position + ";base64,".len()..])
+            .ok()?;
+        return String::from_utf8(bytes).ok();
+    }
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return None;
+    }
+    fs::read_to_string(base.join(src)).ok()
+}
+
+fn resource_base(src: &str, base: &Path) -> PathBuf {
+    if src.starts_with("data:") || src.starts_with("http://") || src.starts_with("https://") {
+        return base.to_path_buf();
+    }
+    base.join(src)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| base.to_path_buf())
 }
 
 fn clean_family(value: &str) -> Option<String> {
@@ -519,6 +731,9 @@ impl Length {
             Unit::Pt => self.value,
             Unit::Px => self.value * 0.75,
             Unit::Em => self.value * parent_size,
+            Unit::In => self.value * 72.0,
+            Unit::Cm => self.value * 72.0 / 2.54,
+            Unit::Mm => self.value * 72.0 / 25.4,
             Unit::Percent => parent_size * self.value / 100.0,
         }
     }
@@ -581,6 +796,12 @@ fn parse_length(input: &str) -> Option<Length> {
         (value, Unit::Pt)
     } else if let Some(value) = text.strip_suffix("em") {
         (value, Unit::Em)
+    } else if let Some(value) = text.strip_suffix("in") {
+        (value, Unit::In)
+    } else if let Some(value) = text.strip_suffix("cm") {
+        (value, Unit::Cm)
+    } else if let Some(value) = text.strip_suffix("mm") {
+        (value, Unit::Mm)
     } else if let Some(value) = text.strip_suffix('%') {
         (value, Unit::Percent)
     } else {

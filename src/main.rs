@@ -14,6 +14,9 @@ fn help() {
     println!("  --font NAME    Default font family (default: Helvetica)");
     println!("  --dpi NUMBER   Pixels per inch for px units (default: 96)");
     println!("  --max-image-bytes N  Ignore images larger than N bytes");
+    println!("  --remote       Allow remote CSS/font/image URLs");
+    println!("  --allow-host HOST  Restrict remote URLs to this host (repeatable)");
+    println!("  --chroot DIR   Confine local resources to DIR");
     println!("  --help         Show this help");
 }
 
@@ -81,6 +84,19 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                     )
                 })?;
                 options = options.image_byte_limit(limit);
+            }
+            "--remote" => options = options.remote_resources(),
+            "--allow-host" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--allow-host needs a value")
+                })?;
+                options = options.allow_remote_host(&value);
+            }
+            "--chroot" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--chroot needs a value")
+                })?;
+                options = options.chroot(&value);
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(

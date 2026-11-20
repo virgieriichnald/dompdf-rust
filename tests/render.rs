@@ -442,3 +442,87 @@ fn embeds_ttf_font() {
     assert!(raw.contains("/FontFile2"));
     assert!(raw.contains("Tj"));
 }
+
+#[test]
+fn applies_media_rules_and_conditional_imports() {
+    use std::fs;
+
+    let pdf = html2pdf_rs::render_html(
+        "<style>@media screen { p { color: blue } }\
+         @media print and (min-width: 100px) { p { color: red } }</style><p>Media</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("1 0 0 rg"));
+    assert!(!raw.contains("0 0 1 rg"));
+
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-media-{}", std::process::id()));
+    let css = directory.join("css");
+    fs::create_dir_all(&css).unwrap();
+    fs::write(
+        css.join("main.css"),
+        "@import url('print.css') print; @import url('screen.css') screen;",
+    )
+    .unwrap();
+    fs::write(css.join("print.css"), "p { color: green }").unwrap();
+    fs::write(css.join("screen.css"), "p { color: blue }").unwrap();
+
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<link rel=\"stylesheet\" href=\"css/main.css\"><p>Impor</p>",
+        &directory,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    fs::remove_dir_all(&directory).unwrap();
+
+    assert!(raw.contains("0 0.5019608 0 rg"));
+    assert!(!raw.contains("0 0 1 rg"));
+}
+
+#[test]
+fn applies_page_pseudo_and_named_rules() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 200pt 300pt } @page :first { size: 100pt 150pt }</style>\
+         <p>Pertama</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("100 150"));
+
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page cover { size: 300pt 400pt } body { page: cover }</style><p>Sampul</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("300 400"));
+}
+
+#[test]
+fn restricts_local_resources_with_chroot() {
+    use html2pdf_rs::{ResourcePolicy, read_bytes};
+    use std::fs;
+
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-chroot-{}", std::process::id()));
+    let root = directory.join("root");
+    let outside = directory.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("allowed.txt"), "allowed").unwrap();
+    fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+    let policy = ResourcePolicy::default().chroot(&root.to_string_lossy());
+    let allowed = read_bytes("allowed.txt", &root, &policy);
+    let blocked = read_bytes("../outside/secret.txt", &root, &policy);
+    fs::remove_dir_all(&directory).unwrap();
+
+    assert_eq!(allowed.as_deref(), Some(b"allowed".as_slice()));
+    assert!(blocked.is_none());
+}
+
+#[test]
+fn resolves_css_variables_and_calc() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>:root { --warna: red; --ukuran: 20pt }\
+         p { color: var(--warna); font-size: calc(var(--ukuran) + 4pt) }</style><p>Variabel</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("1 0 0 rg"));
+    assert!(raw.contains("24 Tf"));
+}

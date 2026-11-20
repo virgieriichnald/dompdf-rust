@@ -99,7 +99,7 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             for link in &line.links {
                 let link_id = Ref::new(next_id);
                 next_id += 1;
-                write_link(&mut pdf, link_id, page_id, document, line, link);
+                write_link(&mut pdf, link_id, page_id, &page.geometry, line, link);
                 links.push(link_id);
             }
         }
@@ -108,8 +108,8 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         page_writer.parent(pages_id).media_box(Rect::new(
             0.0,
             0.0,
-            document.width,
-            document.height,
+            page.geometry.width,
+            page.geometry.height,
         ));
 
         {
@@ -209,12 +209,12 @@ fn write_link(
     pdf: &mut Pdf,
     link_id: Ref,
     page_id: Ref,
-    document: &Document,
+    geometry: &crate::layout::PageGeometry,
     line: &crate::layout::Line,
     link: &crate::layout::LinkRect,
 ) {
-    let x = document.margin + line.left + link.x;
-    let top = document.height - document.margin - line.top;
+    let x = geometry.margin + line.left + link.x;
+    let top = geometry.height - geometry.margin - line.top;
     let bottom = top - line.height;
 
     let mut annotation = pdf.annotation(link_id);
@@ -247,24 +247,23 @@ fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
 
 fn build_content(page: &Page, document: &Document) -> Vec<u8> {
     let mut content = Content::new();
+    let width = page.geometry.width;
+    let height = page.geometry.height;
+    let margin = page.geometry.margin;
 
     for line in &page.lines {
         let x = match line.align {
-            TextAlign::Left | TextAlign::Justify => document.margin,
-            TextAlign::Center => {
-                document.margin + (document.width - 2.0 * document.margin - line.width) / 2.0
-            }
-            TextAlign::Right => {
-                document.margin + document.width - 2.0 * document.margin - line.width
-            }
+            TextAlign::Left | TextAlign::Justify => margin,
+            TextAlign::Center => margin + (width - 2.0 * margin - line.width) / 2.0,
+            TextAlign::Right => margin + width - 2.0 * margin - line.width,
         } + line.left;
-        let line_y = document.height - document.margin - line.top - line.height;
+        let line_y = height - margin - line.top - line.height;
         let line_width = line.background_width.unwrap_or(line.width);
 
         if let Some(color) = line.background {
             content
                 .set_fill_rgb(color[0], color[1], color[2])
-                .rect(document.margin + line.left, line_y, line_width, line.height)
+                .rect(margin + line.left, line_y, line_width, line.height)
                 .fill_nonzero();
         }
 
@@ -277,21 +276,21 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
 
             if border.top {
                 content.rect(
-                    document.margin + line.left,
+                    margin + line.left,
                     line_y + line.height - width,
                     line_width,
                     width,
                 );
             }
             if border.bottom {
-                content.rect(document.margin + line.left, line_y, line_width, width);
+                content.rect(margin + line.left, line_y, line_width, width);
             }
             if border.left {
-                content.rect(document.margin + line.left, line_y, width, line.height);
+                content.rect(margin + line.left, line_y, width, line.height);
             }
             if border.right {
                 content.rect(
-                    document.margin + line.left + line_width - width,
+                    margin + line.left + line_width - width,
                     line_y,
                     width,
                     line.height,
@@ -319,7 +318,7 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
             if gaps == 0 {
                 0.0
             } else {
-                let available = document.width - 2.0 * document.margin - line.left;
+                let available = width - 2.0 * margin - line.left;
                 (available - line.width) / gaps as f32
             }
         } else {
@@ -376,7 +375,7 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
                 }
                 InlineItem::Image(image) => {
                     let top = line.top + (line.height - image.height) / 2.0;
-                    let y = document.height - document.margin - top - image.height;
+                    let y = height - margin - top - image.height;
                     let name = format!("Im{}", image.image + 1);
 
                     content

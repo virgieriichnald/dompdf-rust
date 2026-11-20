@@ -1,16 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
-use crate::Options;
 use crate::css::{
-    BorderSpec, Display, FontFace, ListStyle, Rule, Style, TextAlign, WhiteSpace, parse_color,
-    parse_font_faces, parse_length, parse_page_rules, parse_styles, px_scale, style_for,
+    BorderSpec, Display, FontFace, ListStyle, MediaContext, PageRules, Rule, Style, TextAlign,
+    WhiteSpace, parse_color, parse_font_faces, parse_length, parse_page_rules, parse_styles,
+    px_scale, style_for,
 };
+use crate::{Options, ResourcePolicy, read_bytes};
 
 const HELVETICA_WIDTHS: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
@@ -103,9 +102,17 @@ pub struct Line {
     pub links: Vec<LinkRect>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PageGeometry {
+    pub width: f32,
+    pub height: f32,
+    pub margin: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Page {
     pub lines: Vec<Line>,
+    pub geometry: PageGeometry,
 }
 
 #[derive(Clone, Debug)]
@@ -159,32 +166,58 @@ impl Document {
     pub fn from_html_with_options(html: &str, base: &Path, options: &Options) -> Self {
         let parsed = Html::parse_document(html);
         let base = resolve_base(&parsed, base);
-        let rules = parse_styles(&parsed, &base);
-        let font_faces = parse_font_faces(&parsed, &base);
         let metadata = parse_metadata(&parsed);
         let mut options = options.clone();
-        let page = parse_page_rules(&parsed, &base, options.dpi);
-        if let Some(width) = page.width {
+        let provisional_media = MediaContext {
+            media_type: "print".to_string(),
+            width: options.width * options.dpi / 72.0,
+            height: options.height * options.dpi / 72.0,
+        };
+        let page_rules = parse_page_rules(
+            &parsed,
+            &base,
+            options.dpi,
+            &provisional_media,
+            &options.resource,
+        );
+        let default_page = page_rules.default.clone();
+        if let Some(width) = default_page.width {
             options.width = width;
         }
-        if let Some(height) = page.height {
+        if let Some(height) = default_page.height {
             options.height = height;
         }
-        if let Some(margin) = page.margin {
+        if let Some(margin) = default_page.margin {
             options.margin = margin;
         }
+        let media = MediaContext {
+            media_type: "print".to_string(),
+            width: options.width * options.dpi / 72.0,
+            height: options.height * options.dpi / 72.0,
+        };
+        let rules = parse_styles(&parsed, &base, &media, &options.resource);
+        let font_faces = parse_font_faces(&parsed, &base, &media, &options.resource);
         let base_style = Style {
             font_family: options.default_font.clone(),
             px_scale: px_scale(options.dpi),
             ..Style::default()
         };
+        let geometry = PageGeometry {
+            width: options.width,
+            height: options.height,
+            margin: options.margin,
+        };
         let mut collector = Collector::new(
-            options.width - 2.0 * options.margin,
-            options.height - 2.0 * options.margin,
+            geometry,
             &base,
             base_style.px_scale,
             options.image_byte_limit,
+            options.resource.clone(),
+            page_rules,
         );
+        let initial_geometry = collector.geometry_for(0);
+        collector.pages[0].geometry = initial_geometry;
+        collector.apply_geometry(initial_geometry);
 
         collector.load_fonts(&font_faces);
         walk(parsed.root_element(), &base_style, &rules, &mut collector);
@@ -291,6 +324,9 @@ struct Collector {
     current: Vec<InlineItem>,
     width: f32,
     height: f32,
+    default_geometry: PageGeometry,
+    page_rules: PageRules,
+    page_name: Option<String>,
     pending_before: f32,
     pending_indent: f32,
     align: TextAlign,
@@ -309,26 +345,36 @@ struct Collector {
     lists: Vec<ListState>,
     px_scale: f32,
     image_byte_limit: Option<usize>,
+    policy: ResourcePolicy,
 }
 
 impl Collector {
     fn new(
-        max_width: f32,
-        page_height: f32,
+        geometry: PageGeometry,
         base: &Path,
         px_scale: f32,
         image_byte_limit: Option<usize>,
+        policy: ResourcePolicy,
+        page_rules: PageRules,
     ) -> Self {
+        let content_width = geometry.width - 2.0 * geometry.margin;
+        let content_height = geometry.height - 2.0 * geometry.margin;
         Self {
-            pages: vec![Page { lines: Vec::new() }],
+            pages: vec![Page {
+                lines: Vec::new(),
+                geometry,
+            }],
             current: Vec::new(),
             width: 0.0,
             height: 0.0,
+            default_geometry: geometry,
+            page_rules,
+            page_name: None,
             pending_before: 0.0,
             pending_indent: 0.0,
             align: TextAlign::Left,
-            max_width,
-            page_height,
+            max_width: content_width,
+            page_height: content_height,
             cursor: 0.0,
             base: base.to_path_buf(),
             images: Vec::new(),
@@ -342,11 +388,32 @@ impl Collector {
             lists: Vec::new(),
             px_scale,
             image_byte_limit,
+            policy,
         }
     }
 
+    fn geometry_for(&self, index: usize) -> PageGeometry {
+        let rule = self.page_rules.for_index(index, self.page_name.as_deref());
+        PageGeometry {
+            width: rule.width.unwrap_or(self.default_geometry.width),
+            height: rule.height.unwrap_or(self.default_geometry.height),
+            margin: rule.margin_points(self.default_geometry.margin),
+        }
+    }
+
+    fn apply_geometry(&mut self, geometry: PageGeometry) {
+        self.max_width = geometry.width - 2.0 * geometry.margin;
+        self.page_height = geometry.height - 2.0 * geometry.margin;
+    }
+
     fn new_page(&mut self) {
-        self.pages.push(Page { lines: Vec::new() });
+        let index = self.pages.len();
+        let geometry = self.geometry_for(index);
+        self.pages.push(Page {
+            lines: Vec::new(),
+            geometry,
+        });
+        self.apply_geometry(geometry);
         self.cursor = 0.0;
     }
 
@@ -571,7 +638,7 @@ impl Collector {
         let index = if let Some(cached) = self.image_cache.get(&key) {
             *cached
         } else {
-            let loaded = read_resource(src, &self.base)
+            let loaded = read_bytes(src, &self.base, &self.policy)
                 .and_then(|bytes| {
                     if self
                         .image_byte_limit
@@ -646,7 +713,7 @@ impl Collector {
                 face.italic
             );
             if !self.font_cache.contains_key(&key) {
-                let loaded = read_resource(&face.src, &face.base)
+                let loaded = read_bytes(&face.src, &face.base, &self.policy)
                     .and_then(|bytes| load_font(&face.family, &bytes, face.bold, face.italic))
                     .map(|font| {
                         self.fonts.push(font);
@@ -656,20 +723,6 @@ impl Collector {
             }
         }
     }
-}
-
-fn read_resource(src: &str, base: &Path) -> Option<Vec<u8>> {
-    if let Some(position) = src.find(";base64,") {
-        return base64::engine::general_purpose::STANDARD
-            .decode(&src[position + ";base64,".len()..])
-            .ok();
-    }
-
-    if src.starts_with("http://") || src.starts_with("https://") {
-        return None;
-    }
-
-    fs::read(base.join(src)).ok()
 }
 
 fn load_image_bytes(bytes: &[u8]) -> Option<ImageAsset> {
@@ -845,6 +898,15 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     }
 
     let mut style = style_for(&element, parent, rules);
+
+    if collector.page_name.is_none()
+        && let Some(name) = &style.page_name
+    {
+        collector.page_name = Some(name.clone());
+        let geometry = collector.geometry_for(0);
+        collector.pages[0].geometry = geometry;
+        collector.apply_geometry(geometry);
+    }
 
     if tag == "table"
         && let Some(width) = element

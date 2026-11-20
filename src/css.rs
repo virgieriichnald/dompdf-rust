@@ -1,10 +1,27 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use scraper::{ElementRef, Selector};
 
+use crate::{ResourcePolicy, read_text, resource_base};
+
 pub const DEFAULT_DPI: f32 = 96.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaContext {
+    pub media_type: String,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for MediaContext {
+    fn default() -> Self {
+        Self {
+            media_type: "print".to_string(),
+            width: 595.28 * DEFAULT_DPI / 72.0,
+            height: 841.89 * DEFAULT_DPI / 72.0,
+        }
+    }
+}
 
 pub fn px_scale(dpi: f32) -> f32 {
     72.0 / dpi.max(1.0)
@@ -84,6 +101,85 @@ pub struct PageRule {
     pub width: Option<f32>,
     pub height: Option<f32>,
     pub margin: Option<f32>,
+    pub margin_top: Option<f32>,
+    pub margin_right: Option<f32>,
+    pub margin_bottom: Option<f32>,
+    pub margin_left: Option<f32>,
+}
+
+impl PageRule {
+    fn overlay(&mut self, other: &PageRule) {
+        if other.width.is_some() {
+            self.width = other.width;
+        }
+        if other.height.is_some() {
+            self.height = other.height;
+        }
+        if other.margin.is_some() {
+            self.margin = other.margin;
+        }
+        if other.margin_top.is_some() {
+            self.margin_top = other.margin_top;
+        }
+        if other.margin_right.is_some() {
+            self.margin_right = other.margin_right;
+        }
+        if other.margin_bottom.is_some() {
+            self.margin_bottom = other.margin_bottom;
+        }
+        if other.margin_left.is_some() {
+            self.margin_left = other.margin_left;
+        }
+    }
+
+    pub fn margin_points(&self, fallback: f32) -> f32 {
+        let sides = [
+            self.margin_top.or(self.margin),
+            self.margin_right.or(self.margin),
+            self.margin_bottom.or(self.margin),
+            self.margin_left.or(self.margin),
+        ];
+        let specified = sides.into_iter().flatten().collect::<Vec<_>>();
+        if specified.is_empty() {
+            fallback
+        } else {
+            specified.iter().sum::<f32>() / specified.len() as f32
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PageRules {
+    pub default: PageRule,
+    pub first: PageRule,
+    pub left: PageRule,
+    pub right: PageRule,
+    pub named: std::collections::HashMap<String, PageRule>,
+}
+
+impl PageRules {
+    pub fn for_index(&self, index: usize, name: Option<&str>) -> PageRule {
+        let mut rule = self.default.clone();
+        let pseudo = if index == 0 {
+            None
+        } else if index % 2 == 1 {
+            Some(&self.right)
+        } else {
+            Some(&self.left)
+        };
+        if let Some(pseudo) = pseudo {
+            rule.overlay(pseudo);
+        }
+        if index == 0 {
+            rule.overlay(&self.first);
+        }
+        if let Some(name) = name
+            && let Some(named) = self.named.get(name)
+        {
+            rule.overlay(named);
+        }
+        rule
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +252,8 @@ pub struct Style {
     pub text_indent: Length,
     pub letter_spacing: Length,
     pub white_space: WhiteSpace,
+    pub page_name: Option<String>,
+    pub variables: std::collections::HashMap<String, String>,
 }
 
 impl Default for Style {
@@ -185,6 +283,8 @@ impl Default for Style {
             text_indent: Length::default(),
             letter_spacing: Length::default(),
             white_space: WhiteSpace::Normal,
+            page_name: None,
+            variables: std::collections::HashMap::new(),
         }
     }
 }
@@ -204,6 +304,8 @@ impl Style {
             text_indent: parent.text_indent,
             letter_spacing: parent.letter_spacing,
             white_space: parent.white_space,
+            page_name: parent.page_name.clone(),
+            variables: parent.variables.clone(),
             ..Self::default()
         }
     }
@@ -268,22 +370,54 @@ pub struct Rule {
     pub declarations: Vec<Declaration>,
     pub specificity: u32,
     pub order: usize,
+    pub origin: u32,
 }
 
-pub fn parse_styles(html: &scraper::Html, base: &Path) -> Vec<Rule> {
-    let sheets = stylesheets(html, base);
+const UA_CSS: &str = include_str!("../../lib/res/html.css");
+
+pub fn parse_styles(
+    html: &scraper::Html,
+    base: &Path,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+) -> Vec<Rule> {
+    let sheets = stylesheets(html, base, media, policy);
     let mut rules = Vec::new();
     let mut order = 0usize;
 
+    rules.extend(parse_css(&ua_stylesheet(), &mut order, media, 0));
     for (text, _) in &sheets {
-        rules.extend(parse_css(text, &mut order));
+        rules.extend(parse_css(text, &mut order, media, 1));
     }
 
     rules
 }
 
-pub fn parse_font_faces(html: &scraper::Html, base: &Path) -> Vec<FontFace> {
-    let sheets = stylesheets(html, base);
+fn ua_stylesheet() -> String {
+    let clean = strip_comments(UA_CSS);
+    let mut output = String::new();
+    let mut rest = clean.as_str();
+
+    while rest.contains('{') {
+        let Some((prelude, _, end)) = find_block(rest, 0) else {
+            break;
+        };
+        if !prelude.starts_with("@page") {
+            output.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+pub fn parse_font_faces(
+    html: &scraper::Html,
+    base: &Path,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+) -> Vec<FontFace> {
+    let sheets = stylesheets(html, base, media, policy);
     let mut faces = Vec::new();
 
     for (text, sheet_base) in &sheets {
@@ -293,55 +427,145 @@ pub fn parse_font_faces(html: &scraper::Html, base: &Path) -> Vec<FontFace> {
     faces
 }
 
-pub fn parse_page_rules(html: &scraper::Html, base: &Path, dpi: f32) -> PageRule {
-    let sheets = stylesheets(html, base);
+pub fn parse_page_rules(
+    html: &scraper::Html,
+    base: &Path,
+    dpi: f32,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+) -> PageRules {
+    let sheets = stylesheets(html, base, media, policy);
     let scale = px_scale(dpi);
-    let mut page = PageRule::default();
+    let mut rules = PageRules::default();
 
     for (text, _) in &sheets {
-        let clean = strip_comments(text);
-        let mut rest = clean.as_str();
+        collect_page_rules(text, media, scale, &mut rules);
+    }
 
-        while let Some(position) = rest.find("@page") {
-            let after = &rest[position + "@page".len()..];
-            let Some(open) = after.find('{') else {
-                break;
-            };
-            let selector = after[..open].trim();
-            let after_open = &after[open + 1..];
-            let Some(close) = after_open.find('}') else {
-                break;
-            };
-            rest = &after_open[close + 1..];
+    rules
+}
 
-            if !selector.is_empty() {
-                continue;
+enum PageTarget {
+    Default,
+    First,
+    Left,
+    Right,
+    Named(String),
+}
+
+fn collect_page_rules(input: &str, media: &MediaContext, scale: f32, rules: &mut PageRules) {
+    let clean = strip_comments(input);
+    let mut rest = clean.as_str();
+
+    while rest.contains('{') {
+        let Some((prelude, body, end)) = find_block(rest, 0) else {
+            break;
+        };
+        rest = &rest[end..];
+
+        if let Some(query) = prelude.strip_prefix("@media") {
+            if media_matches(query.trim(), media) {
+                collect_page_rules(&body, media, scale, rules);
             }
+            continue;
+        }
 
-            for (property, value) in parse_declarations(&after_open[..close]) {
-                match property.as_str() {
-                    "size" => {
-                        let (dimensions, landscape) = parse_page_size(&value, scale);
-                        if let Some((mut width, mut height)) = dimensions {
-                            if landscape {
-                                std::mem::swap(&mut width, &mut height);
-                            }
-                            page.width = Some(width);
-                            page.height = Some(height);
-                        }
-                    }
-                    "margin" => {
-                        if let Some(length) = parse_length(&value) {
-                            page.margin = Some(length.resolve_with(12.0, scale));
-                        }
-                    }
-                    _ => {}
-                }
+        let Some(selector) = prelude.strip_prefix("@page") else {
+            continue;
+        };
+
+        for raw in selector.split(',') {
+            for target in parse_page_selector(raw.trim()) {
+                let page = match target {
+                    PageTarget::Default => &mut rules.default,
+                    PageTarget::First => &mut rules.first,
+                    PageTarget::Left => &mut rules.left,
+                    PageTarget::Right => &mut rules.right,
+                    PageTarget::Named(name) => rules.named.entry(name).or_default(),
+                };
+                apply_page_declarations(&body, scale, page);
             }
         }
     }
+}
 
-    page
+fn parse_page_selector(selector: &str) -> Vec<PageTarget> {
+    if selector.is_empty() || selector.eq_ignore_ascii_case("auto") {
+        return vec![PageTarget::Default];
+    }
+
+    let mut name = None;
+    let mut pseudo = None;
+    for part in selector.split(':') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "first" => pseudo = Some(PageTarget::First),
+            "left" => pseudo = Some(PageTarget::Left),
+            "right" => pseudo = Some(PageTarget::Right),
+            _ => name = Some(part.to_string()),
+        }
+    }
+
+    let mut targets = Vec::new();
+    if let Some(name) = name {
+        targets.push(PageTarget::Named(name));
+    }
+    if let Some(pseudo) = pseudo {
+        targets.push(pseudo);
+    } else if targets.is_empty() {
+        targets.push(PageTarget::Default);
+    }
+    targets
+}
+
+fn apply_page_declarations(body: &str, scale: f32, page: &mut PageRule) {
+    for (property, value) in parse_declarations(body) {
+        match property.as_str() {
+            "size" => {
+                let (dimensions, landscape) = parse_page_size(&value, scale);
+                if let Some((mut width, mut height)) = dimensions {
+                    if landscape {
+                        std::mem::swap(&mut width, &mut height);
+                    }
+                    page.width = Some(width);
+                    page.height = Some(height);
+                }
+            }
+            "margin" => {
+                if let Some(sides) = parse_box_shorthand(&value) {
+                    let points = sides.map(|length| length.resolve_with(12.0, scale));
+                    page.margin_top = Some(points[0]);
+                    page.margin_right = Some(points[1]);
+                    page.margin_bottom = Some(points[2]);
+                    page.margin_left = Some(points[3]);
+                    page.margin = Some((points[0] + points[1] + points[2] + points[3]) / 4.0);
+                } else if let Some(length) = parse_length(&value) {
+                    let points = length.resolve_with(12.0, scale);
+                    page.margin_top = Some(points);
+                    page.margin_right = Some(points);
+                    page.margin_bottom = Some(points);
+                    page.margin_left = Some(points);
+                    page.margin = Some(points);
+                }
+            }
+            "margin-top" => {
+                page.margin_top = parse_length(&value).map(|l| l.resolve_with(12.0, scale))
+            }
+            "margin-right" => {
+                page.margin_right = parse_length(&value).map(|l| l.resolve_with(12.0, scale))
+            }
+            "margin-bottom" => {
+                page.margin_bottom = parse_length(&value).map(|l| l.resolve_with(12.0, scale))
+            }
+            "margin-left" => {
+                page.margin_left = parse_length(&value).map(|l| l.resolve_with(12.0, scale))
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_page_size(value: &str, scale: f32) -> (Option<(f32, f32)>, bool) {
@@ -445,7 +669,12 @@ pub fn paper_size(name: &str) -> Option<(f32, f32)> {
     Some(size)
 }
 
-fn stylesheets(html: &scraper::Html, base: &Path) -> Vec<(String, PathBuf)> {
+fn stylesheets(
+    html: &scraper::Html,
+    base: &Path,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+) -> Vec<(String, PathBuf)> {
     let selector = Selector::parse("style, link").expect("valid selector");
     let mut raw = Vec::new();
 
@@ -464,7 +693,7 @@ fn stylesheets(html: &scraper::Html, base: &Path) -> Vec<(String, PathBuf)> {
                 if !is_stylesheet {
                     continue;
                 }
-                if let Some(text) = read_text_resource(href, base) {
+                if let Some(text) = read_text(href, base, policy) {
                     raw.push((text, resource_base(href, base)));
                 }
             }
@@ -474,12 +703,18 @@ fn stylesheets(html: &scraper::Html, base: &Path) -> Vec<(String, PathBuf)> {
 
     let mut expanded = Vec::new();
     for (text, sheet_base) in raw {
-        expand_css(&text, &sheet_base, &mut expanded);
+        expand_css(&text, &sheet_base, media, policy, &mut expanded);
     }
     expanded
 }
 
-fn expand_css(input: &str, base: &Path, out: &mut Vec<(String, PathBuf)>) {
+fn expand_css(
+    input: &str,
+    base: &Path,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+    out: &mut Vec<(String, PathBuf)>,
+) {
     let clean = strip_comments(input);
     let mut segments = Vec::new();
     let mut imports = Vec::new();
@@ -493,8 +728,9 @@ fn expand_css(input: &str, base: &Path, out: &mut Vec<(String, PathBuf)>) {
             break;
         };
         let statement = &after[..semicolon];
-        if let Some(url) = extract_url(statement)
-            && let Some(text) = read_text_resource(&url, base)
+        if let Some(url) = extract_url(statement).or_else(|| extract_quoted_value(statement))
+            && media_matches(import_media(statement), media)
+            && let Some(text) = read_text(&url, base, policy)
         {
             imports.push((text, resource_base(&url, base)));
         }
@@ -507,9 +743,34 @@ fn expand_css(input: &str, base: &Path, out: &mut Vec<(String, PathBuf)>) {
             out.push((text, segment_base));
         }
         if let Some((import, import_base)) = imports.get(index) {
-            expand_css(import, import_base, out);
+            expand_css(import, import_base, media, policy, out);
         }
     }
+}
+
+fn extract_quoted_value(input: &str) -> Option<String> {
+    let text = input.trim();
+    let quote = text.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = text[1..].find(quote)? + 1;
+    Some(text[1..end].to_string())
+}
+
+fn import_media(statement: &str) -> &str {
+    if let Some(position) = statement.find(')') {
+        return statement[position + 1..].trim();
+    }
+
+    let text = statement.trim();
+    if let Some(quote @ ('"' | '\'')) = text.chars().next()
+        && let Some(position) = text[1..].find(quote)
+    {
+        return text[position + 2..].trim();
+    }
+
+    ""
 }
 
 fn parse_font_faces_css(input: &str, base: &Path) -> Vec<FontFace> {
@@ -568,29 +829,6 @@ fn parse_font_faces_css(input: &str, base: &Path) -> Vec<FontFace> {
     faces
 }
 
-fn read_text_resource(src: &str, base: &Path) -> Option<String> {
-    if let Some(position) = src.find(";base64,") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&src[position + ";base64,".len()..])
-            .ok()?;
-        return String::from_utf8(bytes).ok();
-    }
-    if src.starts_with("http://") || src.starts_with("https://") {
-        return None;
-    }
-    fs::read_to_string(base.join(src)).ok()
-}
-
-fn resource_base(src: &str, base: &Path) -> PathBuf {
-    if src.starts_with("data:") || src.starts_with("http://") || src.starts_with("https://") {
-        return base.to_path_buf();
-    }
-    base.join(src)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| base.to_path_buf())
-}
-
 fn clean_family(value: &str) -> Option<String> {
     let first = value.split(',').next()?.trim();
     let unquoted = first
@@ -630,31 +868,35 @@ fn extract_url(value: &str) -> Option<String> {
     }
 }
 
-pub fn parse_css(input: &str, order: &mut usize) -> Vec<Rule> {
+pub fn parse_css(input: &str, order: &mut usize, media: &MediaContext, origin: u32) -> Vec<Rule> {
     let clean = strip_comments(input);
     let mut rules = Vec::new();
     let mut rest = clean.as_str();
 
-    while let Some(open) = rest.find('{') {
-        let selector_text = rest[..open].trim();
-        let after_open = &rest[open + 1..];
-        let Some(close) = after_open.find('}') else {
+    while rest.contains('{') {
+        let Some((prelude, body, end)) = find_block(rest, 0) else {
             break;
         };
-        let body = &after_open[..close];
-        rest = &after_open[close + 1..];
+        rest = &rest[end..];
 
-        if selector_text.is_empty() || selector_text.starts_with('@') {
+        if let Some(query) = prelude.strip_prefix("@media") {
+            if media_matches(query.trim(), media) {
+                rules.extend(parse_css(&body, order, media, origin));
+            }
             continue;
         }
 
-        let declarations = parse_declarations_detailed(body);
+        if prelude.is_empty() || prelude.starts_with('@') {
+            continue;
+        }
+
+        let declarations = parse_declarations_detailed(&body);
         if declarations.is_empty() {
             continue;
         }
 
         let mut selectors = Vec::new();
-        for raw in selector_text.split(',') {
+        for raw in split_top_level(&prelude, ',') {
             let text = raw.trim();
             if let Ok(selector) = Selector::parse(text) {
                 selectors.push(selector);
@@ -668,13 +910,178 @@ pub fn parse_css(input: &str, order: &mut usize) -> Vec<Rule> {
         rules.push(Rule {
             selectors,
             declarations,
-            specificity: specificity(selector_text),
+            specificity: specificity(&prelude),
             order: *order,
+            origin,
         });
         *order += 1;
     }
 
     rules
+}
+
+fn split_top_level(input: &str, delimiter: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+
+    for ch in input.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ch if ch == delimiter && depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
+}
+
+fn find_block(input: &str, start: usize) -> Option<(String, String, usize)> {
+    let bytes = input.as_bytes();
+    let mut open = start;
+    while open < bytes.len() && bytes[open] != b'{' {
+        open += 1;
+    }
+    if open == bytes.len() {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut cursor = open + 1;
+    while cursor < bytes.len() && depth > 0 {
+        match bytes[cursor] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+
+    Some((
+        input[start..open].trim().to_string(),
+        input[open + 1..cursor - 1].to_string(),
+        cursor,
+    ))
+}
+
+fn media_matches(query: &str, context: &MediaContext) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    query
+        .split(',')
+        .any(|part| media_query_matches(part, context))
+}
+
+fn media_query_matches(query: &str, context: &MediaContext) -> bool {
+    let tokens = tokenize_media_query(query);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let (negated, tokens) = match tokens.first().map(String::as_str) {
+        Some("not") => (true, &tokens[1..]),
+        _ => (false, tokens.as_slice()),
+    };
+    let tokens = tokens
+        .first()
+        .filter(|token| token.as_str() == "only")
+        .map_or(tokens, |_| &tokens[1..]);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let type_matches = matches!(tokens[0].as_str(), "all") || tokens[0] == context.media_type;
+    let features_match = tokens[1..]
+        .iter()
+        .filter(|token| token.as_str() != "and")
+        .all(|token| media_feature_matches(token, context));
+
+    if type_matches && features_match {
+        !negated
+    } else {
+        negated
+    }
+}
+
+fn tokenize_media_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+
+    for ch in query.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ch if ch.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn media_feature_matches(feature: &str, context: &MediaContext) -> bool {
+    let inner = feature.trim().trim_start_matches('(').trim_end_matches(')');
+    let Some((name, value)) = inner.split_once(':') else {
+        return false;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+
+    if name == "orientation" {
+        let landscape = context.width > context.height;
+        return match value.as_str() {
+            "landscape" => landscape,
+            "portrait" => !landscape,
+            _ => false,
+        };
+    }
+
+    let Some(length) = parse_length(&value) else {
+        return false;
+    };
+    let points = length.resolve_with(12.0, px_scale(DEFAULT_DPI));
+    let pixels = points * DEFAULT_DPI / 72.0;
+
+    match name.as_str() {
+        "min-width" => context.width >= pixels,
+        "max-width" => context.width <= pixels,
+        "min-height" => context.height >= pixels,
+        "max-height" => context.height <= pixels,
+        "width" => (context.width - pixels).abs() < 0.5,
+        "height" => (context.height - pixels).abs() < 0.5,
+        _ => false,
+    }
 }
 
 pub fn parse_declarations(input: &str) -> Vec<(String, String)> {
@@ -723,7 +1130,7 @@ pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style 
         for declaration in &rule.declarations {
             declarations.push((
                 declaration.important,
-                1u32,
+                rule.origin,
                 rule.specificity,
                 rule.order,
                 declaration.clone(),
@@ -738,20 +1145,88 @@ pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style 
     }
 
     for attribute in presentational_declarations(element) {
-        declarations.push((false, 0u32, 0, 0, attribute));
+        declarations.push((false, 1u32, 0, 0, attribute));
     }
 
-    declarations.sort_by_key(|(important, inline, specificity, order, _)| {
-        (*important, *inline, *specificity, *order)
+    declarations.sort_by_key(|(important, origin, specificity, order, _)| {
+        (*important, *origin, *specificity, *order)
     });
 
     let values = declarations
         .into_iter()
         .map(|(_, _, _, _, declaration)| declaration)
         .collect::<Vec<_>>();
-    apply_style_declarations(&mut style, &values, parent.font_size);
+
+    let mut variables = parent.variables.clone();
+    for declaration in &values {
+        if let Some(name) = declaration.property.strip_prefix("--") {
+            let name = name.trim().to_ascii_lowercase();
+            let value = resolve_value(&declaration.value, &variables, 0);
+            variables.insert(name, value);
+        }
+    }
+
+    let resolved = values
+        .into_iter()
+        .map(|mut declaration| {
+            declaration.value = resolve_value(&declaration.value, &variables, 0);
+            declaration
+        })
+        .collect::<Vec<_>>();
+    style.variables = variables;
+    apply_style_declarations(&mut style, &resolved, parent.font_size);
 
     style
+}
+
+fn resolve_value(
+    input: &str,
+    variables: &std::collections::HashMap<String, String>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return input.to_string();
+    }
+
+    let mut output = String::new();
+    let mut rest = input;
+
+    while let Some(position) = rest.find("var(") {
+        output.push_str(&rest[..position]);
+        let after = &rest[position + 4..];
+        let Some(end) = find_matching_paren(after) else {
+            output.push_str(&rest[position..]);
+            return output;
+        };
+        let arguments = &after[..end];
+        let (name, fallback) = arguments
+            .split_once(',')
+            .map_or((arguments, None), |(name, fallback)| (name, Some(fallback)));
+        let name = name.trim().trim_start_matches("--").to_ascii_lowercase();
+        let replacement = variables
+            .get(&name)
+            .cloned()
+            .or_else(|| fallback.map(|value| resolve_value(value, variables, depth + 1)))
+            .unwrap_or_default();
+        output.push_str(&replacement);
+        rest = &after[end + 1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn find_matching_paren(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn presentational_declarations(element: &ElementRef) -> Vec<Declaration> {
@@ -865,7 +1340,9 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
             }
             "line-height" => line_height_value = Some(value.to_string()),
             "margin" => {
-                if let Some([top, right, bottom, left]) = parse_box_shorthand(value) {
+                if let Some([top, right, bottom, left]) =
+                    parse_box_shorthand_resolved(value, parent_size, style.px_scale)
+                {
                     style.margin_top = top;
                     style.margin_right = right;
                     style.margin_bottom = bottom;
@@ -873,23 +1350,29 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "margin-top" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.margin_top = length;
                 }
             }
             "margin-right" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.margin_right = length;
                 }
             }
             "margin-bottom" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.margin_bottom = length;
                 }
             }
             "margin-left" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.margin_left = length;
+                }
+            }
+            "page" => {
+                let name = value.trim().trim_matches(['"', '\'']).to_string();
+                if !name.is_empty() {
+                    style.page_name = Some(name);
                 }
             }
             "font-family" => {
@@ -914,7 +1397,9 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "padding" => {
-                if let Some([top, right, bottom, left]) = parse_box_shorthand(value) {
+                if let Some([top, right, bottom, left]) =
+                    parse_box_shorthand_resolved(value, parent_size, style.px_scale)
+                {
                     style.padding_top = top;
                     style.padding_right = right;
                     style.padding_bottom = bottom;
@@ -922,22 +1407,22 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "padding-top" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.padding_top = length;
                 }
             }
             "padding-right" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.padding_right = length;
                 }
             }
             "padding-bottom" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.padding_bottom = length;
                 }
             }
             "padding-left" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.padding_left = length;
                 }
             }
@@ -990,14 +1475,16 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 };
             }
             "text-indent" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
                     style.text_indent = length;
                 }
             }
             "letter-spacing" => {
                 if matches!(value.trim().to_ascii_lowercase().as_str(), "normal") {
                     style.letter_spacing = Length::default();
-                } else if let Some(length) = parse_length(value) {
+                } else if let Some(length) =
+                    parse_length_resolved(value, parent_size, style.px_scale)
+                {
                     style.letter_spacing = length;
                 }
             }
@@ -1057,6 +1544,10 @@ fn parse_box_shorthand(input: &str) -> Option<[Length; 4]> {
 
 fn parse_font_size(input: &str, parent_size: f32, scale: f32) -> Option<f32> {
     let text = input.trim().to_ascii_lowercase();
+    if text.starts_with("calc(") && text.ends_with(')') {
+        return eval_length_expression(&text[5..text.len() - 1], parent_size, scale)
+            .map(|value| value.max(0.0));
+    }
     let scale = match text.as_str() {
         "xx-small" => 0.6,
         "x-small" => 0.75,
@@ -1080,6 +1571,11 @@ fn parse_font_size(input: &str, parent_size: f32, scale: f32) -> Option<f32> {
 
 fn parse_line_height(input: &str, font_size: f32, scale: f32) -> Option<f32> {
     let text = input.trim().to_ascii_lowercase();
+    if text.starts_with("calc(") && text.ends_with(')') {
+        let height =
+            eval_length_expression(&text[5..text.len() - 1], font_size, scale)? / font_size;
+        return (height.is_finite() && height > 0.0).then_some(height);
+    }
     if text == "normal" {
         return Some(1.2);
     }
@@ -1174,6 +1670,194 @@ pub fn parse_length(input: &str) -> Option<Length> {
         .parse::<f32>()
         .ok()
         .map(|value| Length { value, unit })
+}
+
+fn parse_length_resolved(input: &str, font_size: f32, scale: f32) -> Option<Length> {
+    let text = input.trim();
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("calc(") && lower.ends_with(')') {
+        let expression = text.get(5..text.len() - 1)?;
+        return eval_length_expression(expression, font_size, scale).map(|value| Length {
+            value,
+            unit: Unit::Pt,
+        });
+    }
+    parse_length(text)
+}
+
+fn parse_box_shorthand_resolved(input: &str, font_size: f32, scale: f32) -> Option<[Length; 4]> {
+    let values = tokenize_lengths(input)
+        .iter()
+        .map(|token| parse_length_resolved(token, font_size, scale))
+        .collect::<Option<Vec<_>>>()?;
+
+    match values.len() {
+        1 => Some([values[0]; 4]),
+        2 => Some([values[0], values[1], values[0], values[1]]),
+        3 => Some([values[0], values[1], values[2], values[1]]),
+        4 => Some([values[0], values[1], values[2], values[3]]),
+        _ => None,
+    }
+}
+
+fn tokenize_lengths(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+
+    for ch in input.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ch if ch.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn eval_length_expression(input: &str, font_size: f32, scale: f32) -> Option<f32> {
+    let mut parser = CalcParser {
+        input: input.chars().peekable(),
+        font_size,
+        scale,
+    };
+    let value = parser.expression()?;
+    parser.skip_whitespace();
+    if parser.input.peek().is_some() {
+        return None;
+    }
+    value.is_finite().then_some(value)
+}
+
+struct CalcParser<'a> {
+    input: std::iter::Peekable<std::str::Chars<'a>>,
+    font_size: f32,
+    scale: f32,
+}
+
+impl CalcParser<'_> {
+    fn skip_whitespace(&mut self) {
+        while self.input.peek().is_some_and(|ch| ch.is_whitespace()) {
+            self.input.next();
+        }
+    }
+
+    fn expression(&mut self) -> Option<f32> {
+        let mut value = self.term()?;
+        loop {
+            self.skip_whitespace();
+            match self.input.peek() {
+                Some('+') => {
+                    self.input.next();
+                    value += self.term()?;
+                }
+                Some('-') => {
+                    self.input.next();
+                    value -= self.term()?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<f32> {
+        let mut value = self.factor()?;
+        loop {
+            self.skip_whitespace();
+            match self.input.peek() {
+                Some('*') => {
+                    self.input.next();
+                    value *= self.factor()?;
+                }
+                Some('/') => {
+                    self.input.next();
+                    let divisor = self.factor()?;
+                    if divisor == 0.0 {
+                        return None;
+                    }
+                    value /= divisor;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<f32> {
+        self.skip_whitespace();
+        match self.input.peek()? {
+            '+' => {
+                self.input.next();
+                self.factor()
+            }
+            '-' => {
+                self.input.next();
+                Some(-self.factor()?)
+            }
+            '(' => {
+                self.input.next();
+                let value = self.expression()?;
+                self.skip_whitespace();
+                if self.input.next() == Some(')') {
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+            _ => self.number_with_unit(),
+        }
+    }
+
+    fn number_with_unit(&mut self) -> Option<f32> {
+        let mut number = String::new();
+        while self
+            .input
+            .peek()
+            .is_some_and(|ch| ch.is_ascii_digit() || *ch == '.')
+        {
+            number.push(self.input.next()?);
+        }
+        let value = number.parse::<f32>().ok()?;
+
+        let mut unit = String::new();
+        while self
+            .input
+            .peek()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == '%')
+        {
+            unit.push(self.input.next()?);
+        }
+
+        Some(unit_to_points(value, &unit, self.font_size, self.scale))
+    }
+}
+
+fn unit_to_points(value: f32, unit: &str, font_size: f32, scale: f32) -> f32 {
+    match unit.to_ascii_lowercase().as_str() {
+        "px" => value * scale,
+        "pt" => value,
+        "in" => value * 72.0,
+        "cm" => value * 72.0 / 2.54,
+        "mm" => value * 72.0 / 25.4,
+        "pc" => value * 12.0,
+        "em" | "rem" => value * font_size,
+        "%" => value * font_size / 100.0,
+        _ => value,
+    }
 }
 
 fn parse_border(input: &str, sides: [bool; 4], font_size: f32, scale: f32) -> Option<BorderSpec> {

@@ -8,8 +8,8 @@ use ttf_parser::Face;
 
 use crate::Options;
 use crate::css::{
-    BorderSpec, Display, FontFace, Rule, Style, TextAlign, parse_font_faces, parse_page_rules,
-    parse_styles, style_for,
+    BorderSpec, Display, FontFace, ListStyle, Rule, Style, TextAlign, WhiteSpace, parse_color,
+    parse_font_faces, parse_length, parse_page_rules, parse_styles, px_scale, style_for,
 };
 
 const HELVETICA_WIDTHS: [u16; 95] = [
@@ -62,6 +62,8 @@ pub struct Run {
     pub color: [f32; 3],
     pub underline: bool,
     pub link: Option<String>,
+    pub spacing: f32,
+    pub width: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +118,8 @@ pub struct ImageAsset {
 #[derive(Clone, Debug)]
 pub struct EmbeddedFont {
     pub family: String,
+    pub bold: bool,
+    pub italic: bool,
     pub data: Vec<u8>,
     pub advance: HashMap<char, f32>,
     pub glyphs: HashMap<char, u16>,
@@ -159,7 +163,7 @@ impl Document {
         let font_faces = parse_font_faces(&parsed, &base);
         let metadata = parse_metadata(&parsed);
         let mut options = options.clone();
-        let page = parse_page_rules(&parsed, &base);
+        let page = parse_page_rules(&parsed, &base, options.dpi);
         if let Some(width) = page.width {
             options.width = width;
         }
@@ -169,11 +173,17 @@ impl Document {
         if let Some(margin) = page.margin {
             options.margin = margin;
         }
-        let base_style = Style::default();
+        let base_style = Style {
+            font_family: options.default_font.clone(),
+            px_scale: px_scale(options.dpi),
+            ..Style::default()
+        };
         let mut collector = Collector::new(
             options.width - 2.0 * options.margin,
             options.height - 2.0 * options.margin,
             &base,
+            base_style.px_scale,
+            options.image_byte_limit,
         );
 
         collector.load_fonts(&font_faces);
@@ -271,8 +281,9 @@ fn resolve_uri(href: &str, base: &Path) -> String {
 
 #[derive(Clone, Copy, Debug)]
 struct ListState {
-    ordered: bool,
-    counter: usize,
+    style: ListStyle,
+    counter: i64,
+    step: i64,
 }
 
 struct Collector {
@@ -281,6 +292,7 @@ struct Collector {
     width: f32,
     height: f32,
     pending_before: f32,
+    pending_indent: f32,
     align: TextAlign,
     max_width: f32,
     page_height: f32,
@@ -295,16 +307,25 @@ struct Collector {
     style_stack: Vec<(Option<[f32; 3]>, Option<BorderSpec>)>,
     link: Option<String>,
     lists: Vec<ListState>,
+    px_scale: f32,
+    image_byte_limit: Option<usize>,
 }
 
 impl Collector {
-    fn new(max_width: f32, page_height: f32, base: &Path) -> Self {
+    fn new(
+        max_width: f32,
+        page_height: f32,
+        base: &Path,
+        px_scale: f32,
+        image_byte_limit: Option<usize>,
+    ) -> Self {
         Self {
             pages: vec![Page { lines: Vec::new() }],
             current: Vec::new(),
             width: 0.0,
             height: 0.0,
             pending_before: 0.0,
+            pending_indent: 0.0,
             align: TextAlign::Left,
             max_width,
             page_height,
@@ -319,6 +340,8 @@ impl Collector {
             style_stack: Vec::new(),
             link: None,
             lists: Vec::new(),
+            px_scale,
+            image_byte_limit,
         }
     }
 
@@ -342,7 +365,7 @@ impl Collector {
             line.background_width = Some(self.max_width);
         }
         if line.links.is_empty() {
-            line.links = collect_links(&line.items, &self.fonts);
+            line.links = collect_links(&line.items);
         }
         self.pages.last_mut().expect("page exists").lines.push(line);
     }
@@ -356,7 +379,8 @@ impl Collector {
 
         self.cursor += line.space_before;
         line.top = self.cursor;
-        line.left = 0.0;
+        line.left = self.pending_indent;
+        self.pending_indent = 0.0;
         self.cursor += line.height + line.space_after;
         self.push_line(line);
     }
@@ -407,6 +431,7 @@ impl Collector {
             self.border = style.border;
         }
         self.pending_before = self.pending_before.max(style.margin_top_pt());
+        self.pending_indent = style.text_indent_pt();
         self.align = style.text_align;
     }
 
@@ -433,19 +458,40 @@ impl Collector {
             .trim_matches(|ch| ch == '"' || ch == '\'')
             .to_ascii_lowercase();
 
+        let kind = FontKind::from_style(style);
+        let bold = matches!(kind, FontKind::Bold | FontKind::BoldOblique);
+        let italic = matches!(kind, FontKind::Oblique | FontKind::BoldOblique);
+
         self.fonts
             .iter()
-            .position(|font| font.family.to_ascii_lowercase() == family)
+            .position(|font| {
+                font.family.eq_ignore_ascii_case(&family)
+                    && font.bold == bold
+                    && font.italic == italic
+            })
+            .or_else(|| {
+                self.fonts
+                    .iter()
+                    .position(|font| font.family.eq_ignore_ascii_case(&family))
+            })
             .map(FontId::Embedded)
-            .unwrap_or(FontId::Builtin(FontKind::from_style(style)))
+            .unwrap_or(FontId::Builtin(kind))
     }
 
     fn text_width(&self, text: &str, style: &Style) -> f32 {
+        let spacing = style.letter_spacing_pt();
         measure(text, style.font_size, self.font_id(style), &self.fonts)
+            + spacing * text.chars().count() as f32
     }
 
     fn push_text(&mut self, text: &str, style: &Style) {
+        if style.white_space == WhiteSpace::Pre {
+            self.push_text_pre(text, style);
+            return;
+        }
+
         let space_width = self.text_width(" ", style);
+        let wrap = style.white_space != WhiteSpace::Nowrap;
 
         for word in text.split_whitespace() {
             let word_width = self.text_width(word, style);
@@ -455,7 +501,8 @@ impl Collector {
                 space_width
             };
 
-            if !self.current.is_empty() && self.width + extra + word_width > self.max_width {
+            if wrap && !self.current.is_empty() && self.width + extra + word_width > self.max_width
+            {
                 self.flush_line();
             }
 
@@ -468,6 +515,36 @@ impl Collector {
         }
     }
 
+    fn push_text_pre(&mut self, text: &str, style: &Style) {
+        let space_width = self.text_width(" ", style);
+        let mut word = String::new();
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.push_pre_word(&word, style);
+                word.clear();
+                self.flush_line();
+                continue;
+            }
+            if ch.is_whitespace() {
+                self.push_pre_word(&word, style);
+                word.clear();
+                self.push_run(" ", style, space_width);
+            } else {
+                word.push(ch);
+            }
+        }
+        self.push_pre_word(&word, style);
+        self.height = self.height.max(style.font_size * style.line_height);
+    }
+
+    fn push_pre_word(&mut self, word: &str, style: &Style) {
+        if !word.is_empty() {
+            let width = self.text_width(word, style);
+            self.push_run(word, style, width);
+        }
+    }
+
     fn push_run(&mut self, text: &str, style: &Style, width: f32) {
         self.current.push(InlineItem::Text(Run {
             text: text.to_string(),
@@ -476,6 +553,8 @@ impl Collector {
             color: style.color,
             underline: style.underline,
             link: self.link.clone(),
+            spacing: style.letter_spacing_pt(),
+            width,
         }));
         self.width += width;
     }
@@ -494,6 +573,12 @@ impl Collector {
         } else {
             let loaded = read_resource(src, &self.base)
                 .and_then(|bytes| {
+                    if self
+                        .image_byte_limit
+                        .is_some_and(|limit| bytes.len() > limit)
+                    {
+                        return None;
+                    }
                     if src.to_ascii_lowercase().ends_with(".svg") {
                         String::from_utf8(bytes)
                             .ok()
@@ -526,8 +611,8 @@ impl Collector {
         style: &Style,
     ) {
         let asset = &self.images[index];
-        let natural_width = asset.width as f32 * 0.75;
-        let natural_height = asset.height as f32 * 0.75;
+        let natural_width = asset.width as f32 * self.px_scale;
+        let natural_height = asset.height as f32 * self.px_scale;
         let (width, height) = match (attr_width, attr_height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width * natural_height / natural_width),
@@ -554,10 +639,15 @@ impl Collector {
 
     fn load_fonts(&mut self, faces: &[FontFace]) {
         for face in faces {
-            let key = face.family.to_ascii_lowercase();
+            let key = format!(
+                "{}|{}|{}",
+                face.family.to_ascii_lowercase(),
+                face.bold,
+                face.italic
+            );
             if !self.font_cache.contains_key(&key) {
                 let loaded = read_resource(&face.src, &face.base)
-                    .and_then(|bytes| load_font(&face.family, &bytes))
+                    .and_then(|bytes| load_font(&face.family, &bytes, face.bold, face.italic))
                     .map(|font| {
                         self.fonts.push(font);
                         self.fonts.len() - 1
@@ -607,7 +697,7 @@ fn render_svg(svg: &str) -> Option<ImageAsset> {
     load_image_bytes(&pixmap.encode_png().ok()?)
 }
 
-fn load_font(family: &str, bytes: &[u8]) -> Option<EmbeddedFont> {
+fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<EmbeddedFont> {
     let face = Face::parse(bytes, 0).ok()?;
     let units_per_em = face.units_per_em();
     let mut advance = HashMap::new();
@@ -627,6 +717,8 @@ fn load_font(family: &str, bytes: &[u8]) -> Option<EmbeddedFont> {
 
     Some(EmbeddedFont {
         family: family.to_string(),
+        bold,
+        italic,
         data: bytes.to_vec(),
         advance,
         glyphs,
@@ -636,17 +728,14 @@ fn load_font(family: &str, bytes: &[u8]) -> Option<EmbeddedFont> {
     })
 }
 
-fn collect_links(items: &[InlineItem], fonts: &[EmbeddedFont]) -> Vec<LinkRect> {
+fn collect_links(items: &[InlineItem]) -> Vec<LinkRect> {
     let mut links = Vec::new();
     let mut cursor = 0.0;
     let mut active: Option<(String, f32, f32)> = None;
 
     for item in items {
         let (width, link) = match item {
-            InlineItem::Text(run) => (
-                measure(&run.text, run.size, run.font, fonts),
-                run.link.as_ref(),
-            ),
+            InlineItem::Text(run) => (run.width, run.link.as_ref()),
             InlineItem::Image(image) => (image.width, image.link.as_ref()),
         };
 
@@ -684,6 +773,67 @@ fn collect_links(items: &[InlineItem], fonts: &[EmbeddedFont]) -> Vec<LinkRect> 
     links
 }
 
+fn list_marker(style: ListStyle, value: i64) -> Option<String> {
+    let marker = match style {
+        ListStyle::Disc => "• ".to_string(),
+        ListStyle::Circle => "○ ".to_string(),
+        ListStyle::Square => "▪ ".to_string(),
+        ListStyle::None => return None,
+        ListStyle::Decimal => format!("{value}. "),
+        ListStyle::LowerAlpha => format!("{}. ", dec2base26(value, true)),
+        ListStyle::UpperAlpha => format!("{}. ", dec2base26(value, false)),
+        ListStyle::LowerRoman => format!("{}. ", dec2roman(value).to_ascii_lowercase()),
+        ListStyle::UpperRoman => format!("{}. ", dec2roman(value)),
+    };
+
+    Some(marker)
+}
+
+fn dec2base26(value: i64, lowercase: bool) -> String {
+    let mut letters = Vec::new();
+    let mut number = value.max(1) as u64;
+    while number > 0 {
+        let digit = ((number - 1) % 26) as u8;
+        letters.push(if lowercase {
+            b'a' + digit
+        } else {
+            b'A' + digit
+        });
+        number = (number - 1) / 26;
+    }
+    letters.reverse();
+    String::from_utf8(letters).unwrap_or_default()
+}
+
+fn dec2roman(value: i64) -> String {
+    const NUMERALS: [(i64, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+
+    let mut remaining = value.max(1);
+    let mut roman = String::new();
+    for (amount, numeral) in NUMERALS {
+        while remaining >= amount {
+            roman.push_str(numeral);
+            remaining -= amount;
+        }
+    }
+
+    roman
+}
+
 fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Collector) {
     let tag = element.value().name();
 
@@ -697,12 +847,13 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     let mut style = style_for(&element, parent, rules);
 
     if tag == "table"
-        && element
+        && let Some(width) = element
             .attr("border")
-            .is_some_and(|value| value.parse::<u32>().unwrap_or(0) > 0)
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| *value > 0.0)
     {
         style.border = Some(BorderSpec {
-            width: 1.0,
+            width,
             color: [0.0, 0.0, 0.0],
             top: true,
             right: true,
@@ -731,8 +882,12 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if tag == "img" {
         let src = element.attr("src").unwrap_or_default();
         let alt = element.attr("alt").unwrap_or_default();
-        let width = element.attr("width").and_then(parse_dimension);
-        let height = element.attr("height").and_then(parse_dimension);
+        let width = element
+            .attr("width")
+            .and_then(|value| parse_dimension(value, collector.px_scale));
+        let height = element
+            .attr("height")
+            .and_then(|value| parse_dimension(value, collector.px_scale));
         collector.push_image(src, alt, width, height, &style);
         collector.link = previous_link;
         return;
@@ -742,8 +897,12 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         if let Some(asset) = render_svg(&element.html()) {
             collector.images.push(asset);
             let index = collector.images.len() - 1;
-            let width = element.attr("width").and_then(parse_dimension);
-            let height = element.attr("height").and_then(parse_dimension);
+            let width = element
+                .attr("width")
+                .and_then(|value| parse_dimension(value, collector.px_scale));
+            let height = element
+                .attr("height")
+                .and_then(|value| parse_dimension(value, collector.px_scale));
             collector.push_image_item(index, width, height, &style);
         }
         collector.link = previous_link;
@@ -758,9 +917,19 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
 
     let starts_list = matches!(tag, "ul" | "ol");
     if starts_list {
+        let start = element
+            .attr("start")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
+        let step = if element.attr("reversed").is_some() {
+            -1
+        } else {
+            1
+        };
         collector.lists.push(ListState {
-            ordered: tag == "ol",
-            counter: 0,
+            style: style.list_style,
+            counter: start,
+            step,
         });
     }
 
@@ -770,16 +939,15 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     }
 
     if tag == "li" {
-        let prefix = if let Some(state) = collector.lists.last_mut() {
-            state.counter += 1;
-            if state.ordered {
-                format!("{}. ", state.counter)
-            } else {
-                "• ".to_string()
-            }
-        } else {
-            "• ".to_string()
-        };
+        let prefix = collector
+            .lists
+            .last_mut()
+            .and_then(|state| {
+                let value = state.counter;
+                state.counter += state.step;
+                list_marker(state.style, value)
+            })
+            .unwrap_or_else(|| "• ".to_string());
         collector.push_text(&prefix, &style);
     }
 
@@ -819,6 +987,9 @@ fn layout_table<'a>(
     if rows.is_empty() {
         return;
     }
+
+    let cell_padding = table.attr("cellpadding").and_then(parse_length);
+    let table_background = table.attr("bgcolor").and_then(parse_color);
 
     let mut grid = Vec::<Vec<Option<TableCell>>>::new();
     let mut cursors = Vec::new();
@@ -895,7 +1066,20 @@ fn layout_table<'a>(
                 }
             }
 
-            let cell_style = style_for(&cell.element, style, rules);
+            let mut cell_style = style_for(&cell.element, style, rules);
+            let owns_padding = cell
+                .element
+                .attr("style")
+                .is_some_and(|value| value.to_ascii_lowercase().contains("padding"));
+            if !owns_padding && let Some(padding) = cell_padding {
+                cell_style.padding_top = padding;
+                cell_style.padding_right = padding;
+                cell_style.padding_bottom = padding;
+                cell_style.padding_left = padding;
+            }
+            if cell_style.background.is_none() {
+                cell_style.background = table_background;
+            }
             let padding_left = cell_style.padding_left_pt();
             let padding_right = cell_style.padding_right_pt();
             let padding_top = cell_style.padding_top_pt();
@@ -983,7 +1167,7 @@ fn layout_table<'a>(
 
             for mut line in lines {
                 line.top += row_top + padding_top;
-                line.left = x + padding_left;
+                line.left += x + padding_left;
                 collector.push_line(line);
             }
         }
@@ -994,10 +1178,10 @@ fn parse_positive_attr(value: Option<&str>) -> Option<usize> {
     value?.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
-fn parse_dimension(value: &str) -> Option<f32> {
+fn parse_dimension(value: &str, px_scale: f32) -> Option<f32> {
     let text = value.trim().to_ascii_lowercase();
     let (number, scale) = if let Some(number) = text.strip_suffix("px") {
-        (number, 0.75)
+        (number, px_scale)
     } else if let Some(number) = text.strip_suffix("pt") {
         (number, 1.0)
     } else {

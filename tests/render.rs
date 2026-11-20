@@ -37,7 +37,7 @@ fn loads_external_css_and_imports() {
     assert!(raw.contains("Judul"));
     assert!(raw.contains("Paragraf"));
     assert!(raw.contains("1 0 0 rg"));
-    assert!(raw.contains("0 0.5 0 rg"));
+    assert!(raw.contains("0 0.5019608 0 rg"));
 }
 
 #[test]
@@ -225,6 +225,206 @@ fn embeds_inline_svg() {
 
     assert!(raw.contains("/Subtype /Image"));
     assert!(raw.contains("Im1 Do"));
+}
+
+#[test]
+fn parses_extended_color_syntax() {
+    use html2pdf_rs::css::{Style, apply_declarations, parse_declarations};
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("color: rgb(0 0 255 / 50%); background-color: hsl(0, 100%, 50%)"),
+        12.0,
+    );
+
+    assert_eq!(style.color, [0.0, 0.0, 1.0]);
+    assert_eq!(style.background, Some([1.0, 0.0, 0.0]));
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("color: cmyk(0,1,1,0)"),
+        12.0,
+    );
+    assert_eq!(style.color, [1.0, 0.0, 0.0]);
+}
+
+#[test]
+fn applies_box_shorthand_and_unitless_line_height() {
+    use html2pdf_rs::css::{Style, apply_declarations, parse_declarations};
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "margin: 1pt 2pt 3pt 4pt; padding: 5pt 6pt; font-size: large; line-height: 150%",
+        ),
+        12.0,
+    );
+
+    assert_eq!(style.margin_top_pt(), 1.0);
+    assert_eq!(style.margin_right_pt(), 2.0);
+    assert_eq!(style.margin_bottom_pt(), 3.0);
+    assert_eq!(style.margin_left_pt(), 4.0);
+    assert_eq!(style.padding_top_pt(), 5.0);
+    assert_eq!(style.padding_right_pt(), 6.0);
+    assert_eq!(style.padding_bottom_pt(), 5.0);
+    assert_eq!(style.padding_left_pt(), 6.0);
+    assert!((style.font_size - 14.4).abs() < 0.001);
+    assert!((style.line_height - 1.5).abs() < 0.001);
+}
+
+#[test]
+fn resolves_extended_paper_sizes_and_dpi() {
+    use html2pdf_rs::Options;
+    use html2pdf_rs::css::{Length, Unit, paper_size, px_scale};
+
+    assert_eq!(paper_size("B5"), Some((498.90, 708.66)));
+    assert_eq!(paper_size("commercial #10 envelope"), Some((684.0, 297.0)));
+
+    let options = Options::paper("b5").unwrap().dpi(192.0);
+    assert_eq!((options.width, options.height), (498.90, 708.66));
+    assert!((px_scale(192.0) - 0.375).abs() < 0.0001);
+    assert_eq!(
+        Length {
+            value: 192.0,
+            unit: Unit::Px
+        }
+        .resolve_with(12.0, px_scale(192.0)),
+        72.0
+    );
+}
+
+#[test]
+fn rejects_images_over_byte_limit() {
+    use base64::Engine;
+    use html2pdf_rs::Options;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+    use std::path::Path;
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let html = format!("<img src=\"data:image/png;base64,{encoded}\">");
+
+    let rejected = html2pdf_rs::render_html_with_options(
+        &html,
+        Path::new("."),
+        &Options::default().image_byte_limit(4),
+    );
+    let accepted = html2pdf_rs::render_html_with_options(
+        &html,
+        Path::new("."),
+        &Options::default().image_byte_limit(png.len()),
+    );
+
+    assert!(!String::from_utf8_lossy(&rejected).contains("/Subtype /Image"));
+    assert!(String::from_utf8_lossy(&accepted).contains("/Subtype /Image"));
+}
+
+#[test]
+fn embeds_bmp_image() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::bmp::BmpEncoder};
+
+    let mut bmp = Vec::new();
+    let pixels = [0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255];
+    BmpEncoder::new(&mut bmp)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bmp);
+
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<img src=\"data:image/bmp;base64,{encoded}\" width=\"30\">"
+    ));
+
+    assert!(String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
+}
+
+#[test]
+fn applies_presentational_attributes_with_css_precedence() {
+    let pdf = html2pdf_rs::render_html("<p bgcolor=\"#ff0000\" align=\"center\">Teks</p>");
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("1 0 0 rg"));
+
+    let pdf = html2pdf_rs::render_html(
+        "<style>p{background-color:blue}</style><p bgcolor=\"red\">Teks</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("0 0 1 rg"));
+    assert!(!raw.contains("1 0 0 rg"));
+
+    let pdf =
+        html2pdf_rs::render_html("<p bgcolor=\"red\" style=\"background-color:green\">Teks</p>");
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("0 0.5019608 0 rg"));
+    assert!(!raw.contains("1 0 0 rg"));
+}
+
+#[test]
+fn renders_ordered_list_markers() {
+    let pdf = html2pdf_rs::render_html(
+        "<ol start=\"3\" type=\"A\"><li>Satu</li><li>Dua</li></ol>\
+         <ol reversed start=\"2\"><li>Tiga</li></ol>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(C.)"));
+    assert!(raw.contains("(D.)"));
+    assert!(raw.contains("(2.)"));
+}
+
+#[test]
+fn parses_important_and_text_features() {
+    use html2pdf_rs::css::{Style, TextAlign, apply_declarations, parse_declarations};
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "text-align:justify;text-indent:1cm;letter-spacing:2pt;white-space:pre",
+        ),
+        12.0,
+    );
+    assert_eq!(style.text_align, TextAlign::Justify);
+    assert!((style.text_indent_pt() - 28.34645).abs() < 0.01);
+    assert!((style.letter_spacing_pt() - 2.0).abs() < 0.001);
+    assert_eq!(style.white_space, html2pdf_rs::css::WhiteSpace::Pre);
+
+    let pdf = html2pdf_rs::render_html(
+        "<style>p{color:red !important} p{color:blue}</style><p style=\"color:green\">X</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("1 0 0 rg"));
+    assert!(!raw.contains("0 0 1 rg"));
+    assert!(!raw.contains("0 0.5019608 0 rg"));
+}
+
+#[test]
+fn preserves_preformatted_whitespace_and_letter_spacing() {
+    let pdf =
+        html2pdf_rs::render_html("<p style=\"white-space:pre;letter-spacing:2pt\">a  b\nc</p>");
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.matches("( )").count() >= 2);
+    assert!(raw.contains("2 Tc"));
+}
+
+#[test]
+fn embeds_bold_face_for_bold_text() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/fonts");
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<style>@font-face{font-family:F;src:url('DejaVuSans.ttf');}\
+         @font-face{font-family:F;src:url('DejaVuSans-Bold.ttf');font-weight:bold;}\
+         p{font-family:F}</style><p>A <strong>B</strong></p>",
+        &base,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(raw.matches("/FontFile2").count(), 2);
 }
 
 #[test]

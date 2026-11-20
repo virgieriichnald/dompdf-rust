@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::css::paper_size;
+
 pub mod css;
 pub mod layout;
 pub mod pdf;
@@ -9,6 +11,9 @@ pub struct Options {
     pub width: f32,
     pub height: f32,
     pub margin: f32,
+    pub default_font: String,
+    pub dpi: f32,
+    pub image_byte_limit: Option<usize>,
 }
 
 impl Default for Options {
@@ -17,19 +22,16 @@ impl Default for Options {
             width: 595.28,
             height: 841.89,
             margin: 54.0,
+            default_font: "Helvetica".to_string(),
+            dpi: crate::css::DEFAULT_DPI,
+            image_byte_limit: None,
         }
     }
 }
 
 impl Options {
     pub fn paper(name: &str) -> Option<Self> {
-        let (width, height) = match name.to_ascii_lowercase().as_str() {
-            "a4" => (595.28, 841.89),
-            "letter" => (612.0, 792.0),
-            "legal" => (612.0, 1008.0),
-            "a3" => (841.89, 1190.55),
-            _ => return None,
-        };
+        let (width, height) = paper_size(name)?;
         Some(Self {
             width,
             height,
@@ -44,6 +46,23 @@ impl Options {
 
     pub fn margin(mut self, margin: f32) -> Self {
         self.margin = margin.max(0.0);
+        self
+    }
+
+    pub fn font(mut self, family: &str) -> Self {
+        if !family.trim().is_empty() {
+            self.default_font = family.trim().to_string();
+        }
+        self
+    }
+
+    pub fn dpi(mut self, dpi: f32) -> Self {
+        self.dpi = dpi.max(1.0);
+        self
+    }
+
+    pub fn image_byte_limit(mut self, limit: usize) -> Self {
+        self.image_byte_limit = Some(limit);
         self
     }
 }

@@ -8,9 +8,12 @@ fn help() {
     println!("Usage: html2pdf-rs [options] [input.html|-] [output.pdf]");
     println!();
     println!("Options:");
-    println!("  --paper NAME   a4, letter, legal, a3 (default: a4)");
+    println!("  --paper NAME   Named paper size (a4, letter, legal, b5, ...; default: a4)");
     println!("  --landscape    Swap paper width and height");
     println!("  --margin PT    Page margin in points (default: 54)");
+    println!("  --font NAME    Default font family (default: Helvetica)");
+    println!("  --dpi NUMBER   Pixels per inch for px units (default: 96)");
+    println!("  --max-image-bytes N  Ignore images larger than N bytes");
     println!("  --help         Show this help");
 }
 
@@ -48,6 +51,36 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                     )
                 })?;
                 options = options.margin(margin);
+            }
+            "--font" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--font needs a value")
+                })?;
+                options = options.font(&value);
+            }
+            "--dpi" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--dpi needs a value")
+                })?;
+                let dpi = value.parse::<f32>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid dpi: {value}"))
+                })?;
+                options = options.dpi(dpi);
+            }
+            "--max-image-bytes" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--max-image-bytes needs a value",
+                    )
+                })?;
+                let limit = value.parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid image byte limit: {value}"),
+                    )
+                })?;
+                options = options.image_byte_limit(limit);
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(

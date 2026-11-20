@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use scraper::{ElementRef, Selector};
 
+pub const DEFAULT_DPI: f32 = 96.0;
+
+pub fn px_scale(dpi: f32) -> f32 {
+    72.0 / dpi.max(1.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
     Block,
@@ -17,6 +23,29 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+    Justify,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListStyle {
+    #[default]
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    Pre,
+    Nowrap,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -46,6 +75,8 @@ pub struct FontFace {
     pub family: String,
     pub src: String,
     pub base: PathBuf,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -83,9 +114,13 @@ impl Default for Length {
 
 impl Length {
     pub fn resolve(self, font_size: f32) -> f32 {
+        self.resolve_with(font_size, px_scale(DEFAULT_DPI))
+    }
+
+    pub fn resolve_with(self, font_size: f32, scale: f32) -> f32 {
         match self.unit {
             Unit::Pt => self.value,
-            Unit::Px => self.value * 0.75,
+            Unit::Px => self.value * scale,
             Unit::Em => self.value * font_size,
             Unit::In => self.value * 72.0,
             Unit::Cm => self.value * 72.0 / 2.54,
@@ -116,6 +151,11 @@ pub struct Style {
     pub border: Option<BorderSpec>,
     pub text_align: TextAlign,
     pub display: Display,
+    pub px_scale: f32,
+    pub list_style: ListStyle,
+    pub text_indent: Length,
+    pub letter_spacing: Length,
+    pub white_space: WhiteSpace,
 }
 
 impl Default for Style {
@@ -140,6 +180,11 @@ impl Default for Style {
             border: None,
             text_align: TextAlign::Left,
             display: Display::Inline,
+            px_scale: px_scale(DEFAULT_DPI),
+            list_style: ListStyle::Disc,
+            text_indent: Length::default(),
+            letter_spacing: Length::default(),
+            white_space: WhiteSpace::Normal,
         }
     }
 }
@@ -154,47 +199,73 @@ impl Style {
             italic: parent.italic,
             underline: parent.underline,
             line_height: parent.line_height,
+            px_scale: parent.px_scale,
+            list_style: parent.list_style,
+            text_indent: parent.text_indent,
+            letter_spacing: parent.letter_spacing,
+            white_space: parent.white_space,
             ..Self::default()
         }
     }
 
     pub fn margin_top_pt(&self) -> f32 {
-        self.margin_top.resolve(self.font_size)
+        self.margin_top.resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn margin_right_pt(&self) -> f32 {
-        self.margin_right.resolve(self.font_size)
+        self.margin_right
+            .resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn margin_bottom_pt(&self) -> f32 {
-        self.margin_bottom.resolve(self.font_size)
+        self.margin_bottom
+            .resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn margin_left_pt(&self) -> f32 {
-        self.margin_left.resolve(self.font_size)
+        self.margin_left.resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn padding_top_pt(&self) -> f32 {
-        self.padding_top.resolve(self.font_size)
+        self.padding_top.resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn padding_right_pt(&self) -> f32 {
-        self.padding_right.resolve(self.font_size)
+        self.padding_right
+            .resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn padding_bottom_pt(&self) -> f32 {
-        self.padding_bottom.resolve(self.font_size)
+        self.padding_bottom
+            .resolve_with(self.font_size, self.px_scale)
     }
 
     pub fn padding_left_pt(&self) -> f32 {
-        self.padding_left.resolve(self.font_size)
+        self.padding_left
+            .resolve_with(self.font_size, self.px_scale)
     }
+
+    pub fn text_indent_pt(&self) -> f32 {
+        self.text_indent.resolve_with(self.font_size, self.px_scale)
+    }
+
+    pub fn letter_spacing_pt(&self) -> f32 {
+        self.letter_spacing
+            .resolve_with(self.font_size, self.px_scale)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Declaration {
+    pub property: String,
+    pub value: String,
+    pub important: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
-    pub declarations: Vec<(String, String)>,
+    pub declarations: Vec<Declaration>,
     pub specificity: u32,
     pub order: usize,
 }
@@ -222,8 +293,9 @@ pub fn parse_font_faces(html: &scraper::Html, base: &Path) -> Vec<FontFace> {
     faces
 }
 
-pub fn parse_page_rules(html: &scraper::Html, base: &Path) -> PageRule {
+pub fn parse_page_rules(html: &scraper::Html, base: &Path, dpi: f32) -> PageRule {
     let sheets = stylesheets(html, base);
+    let scale = px_scale(dpi);
     let mut page = PageRule::default();
 
     for (text, _) in &sheets {
@@ -249,7 +321,7 @@ pub fn parse_page_rules(html: &scraper::Html, base: &Path) -> PageRule {
             for (property, value) in parse_declarations(&after_open[..close]) {
                 match property.as_str() {
                     "size" => {
-                        let (dimensions, landscape) = parse_page_size(&value);
+                        let (dimensions, landscape) = parse_page_size(&value, scale);
                         if let Some((mut width, mut height)) = dimensions {
                             if landscape {
                                 std::mem::swap(&mut width, &mut height);
@@ -260,7 +332,7 @@ pub fn parse_page_rules(html: &scraper::Html, base: &Path) -> PageRule {
                     }
                     "margin" => {
                         if let Some(length) = parse_length(&value) {
-                            page.margin = Some(length.resolve(12.0));
+                            page.margin = Some(length.resolve_with(12.0, scale));
                         }
                     }
                     _ => {}
@@ -272,7 +344,7 @@ pub fn parse_page_rules(html: &scraper::Html, base: &Path) -> PageRule {
     page
 }
 
-fn parse_page_size(value: &str) -> (Option<(f32, f32)>, bool) {
+fn parse_page_size(value: &str, scale: f32) -> (Option<(f32, f32)>, bool) {
     let mut named = None;
     let mut width = None;
     let mut height = None;
@@ -287,7 +359,7 @@ fn parse_page_size(value: &str) -> (Option<(f32, f32)>, bool) {
                 if let Some(size) = paper_size(&lower) {
                     named = Some(size);
                 } else if let Some(length) = parse_length(token) {
-                    let points = length.resolve(12.0);
+                    let points = length.resolve_with(12.0, scale);
                     if width.is_none() {
                         width = Some(points);
                     } else {
@@ -308,14 +380,69 @@ fn parse_page_size(value: &str) -> (Option<(f32, f32)>, bool) {
     (dimensions, landscape)
 }
 
-fn paper_size(name: &str) -> Option<(f32, f32)> {
-    match name {
-        "a4" => Some((595.28, 841.89)),
-        "letter" => Some((612.0, 792.0)),
-        "legal" => Some((612.0, 1008.0)),
-        "a3" => Some((841.89, 1190.55)),
-        _ => None,
-    }
+pub fn paper_size(name: &str) -> Option<(f32, f32)> {
+    let size = match name.to_ascii_lowercase().replace(' ', "").as_str() {
+        "4a0" => (4767.87, 6740.79),
+        "2a0" => (3370.39, 4767.87),
+        "a0" => (2383.94, 3370.39),
+        "a1" => (1683.78, 2383.94),
+        "a2" => (1190.55, 1683.78),
+        "a3" => (841.89, 1190.55),
+        "a4" => (595.28, 841.89),
+        "a5" => (419.53, 595.28),
+        "a6" => (297.64, 419.53),
+        "a7" => (209.76, 297.64),
+        "a8" => (147.40, 209.76),
+        "a9" => (104.88, 147.40),
+        "a10" => (73.70, 104.88),
+        "b0" => (2834.65, 4008.19),
+        "b1" => (2004.09, 2834.65),
+        "b2" => (1417.32, 2004.09),
+        "b3" => (1000.63, 1417.32),
+        "b4" => (708.66, 1000.63),
+        "b5" => (498.90, 708.66),
+        "b6" => (354.33, 498.90),
+        "b7" => (249.45, 354.33),
+        "b8" => (175.75, 249.45),
+        "b9" => (124.72, 175.75),
+        "b10" => (87.87, 124.72),
+        "c0" => (2599.37, 3676.54),
+        "c1" => (1836.85, 2599.37),
+        "c2" => (1298.27, 1836.85),
+        "c3" => (918.43, 1298.27),
+        "c4" => (649.13, 918.43),
+        "c5" => (459.21, 649.13),
+        "c6" => (323.15, 459.21),
+        "c7" => (229.61, 323.15),
+        "c8" => (161.57, 229.61),
+        "c9" => (113.39, 161.57),
+        "c10" => (79.37, 113.39),
+        "ra0" => (2437.80, 3458.27),
+        "ra1" => (1729.13, 2437.80),
+        "ra2" => (1218.90, 1729.13),
+        "ra3" => (864.57, 1218.90),
+        "ra4" => (609.45, 864.57),
+        "sra0" => (2551.18, 3628.35),
+        "sra1" => (1814.17, 2551.18),
+        "sra2" => (1275.59, 1814.17),
+        "sra3" => (907.09, 1275.59),
+        "sra4" => (637.80, 907.09),
+        "letter" => (612.0, 792.0),
+        "half-letter" => (396.0, 612.0),
+        "legal" => (612.0, 1008.0),
+        "ledger" => (1224.0, 792.0),
+        "tabloid" => (792.0, 1224.0),
+        "executive" => (521.86, 756.0),
+        "folio" => (612.0, 936.0),
+        "commercial#10envelope" => (684.0, 297.0),
+        "catalog#101/2envelope" => (648.0, 864.0),
+        "8.5x11" => (612.0, 792.0),
+        "8.5x14" => (612.0, 1008.0),
+        "11x17" => (792.0, 1224.0),
+        _ => return None,
+    };
+
+    Some(size)
 }
 
 fn stylesheets(html: &scraper::Html, base: &Path) -> Vec<(String, PathBuf)> {
@@ -410,12 +537,30 @@ fn parse_font_faces_css(input: &str, base: &Path) -> Vec<FontFace> {
             .iter()
             .find(|(property, _)| property == "src")
             .and_then(|(_, value)| extract_url(value));
+        let bold = declarations
+            .iter()
+            .find(|(property, _)| property == "font-weight")
+            .is_some_and(|(_, value)| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "bold" || value == "bolder" || value.parse::<u32>().is_ok_and(|w| w >= 600)
+            });
+        let italic = declarations
+            .iter()
+            .find(|(property, _)| property == "font-style")
+            .is_some_and(|(_, value)| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "italic" | "oblique"
+                )
+            });
 
         if let (Some(family), Some(src)) = (family, source) {
             faces.push(FontFace {
                 family,
                 src,
                 base: base.to_path_buf(),
+                bold,
+                italic,
             });
         }
     }
@@ -503,7 +648,7 @@ pub fn parse_css(input: &str, order: &mut usize) -> Vec<Rule> {
             continue;
         }
 
-        let declarations = parse_declarations(body);
+        let declarations = parse_declarations_detailed(body);
         if declarations.is_empty() {
             continue;
         }
@@ -533,16 +678,33 @@ pub fn parse_css(input: &str, order: &mut usize) -> Vec<Rule> {
 }
 
 pub fn parse_declarations(input: &str) -> Vec<(String, String)> {
+    parse_declarations_detailed(input)
+        .into_iter()
+        .map(|declaration| (declaration.property, declaration.value))
+        .collect()
+}
+
+pub fn parse_declarations_detailed(input: &str) -> Vec<Declaration> {
     input
         .split(';')
         .filter_map(|item| {
             let (property, value) = item.split_once(':')?;
             let property = property.trim().to_ascii_lowercase();
-            let value = value.trim().to_string();
+            let value = value.trim();
+            let important = value.to_ascii_lowercase().ends_with("!important");
+            let value = if important {
+                value[..value.len() - "!important".len()].trim()
+            } else {
+                value
+            };
             if property.is_empty() || value.is_empty() {
                 None
             } else {
-                Some((property, value))
+                Some(Declaration {
+                    property,
+                    value: value.to_string(),
+                    important,
+                })
             }
         })
         .collect()
@@ -552,43 +714,145 @@ pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style 
     let tag = element.value().name();
     let mut style = style_for_tag(tag, parent);
 
-    let mut matched = rules
-        .iter()
-        .filter(|rule| {
-            rule.selectors
-                .iter()
-                .any(|selector| selector.matches(element))
-        })
-        .collect::<Vec<_>>();
-    matched.sort_by_key(|rule| (rule.specificity, rule.order));
-
-    for rule in matched {
-        apply_declarations(&mut style, &rule.declarations, parent.font_size);
+    let mut declarations: Vec<(bool, u32, u32, usize, Declaration)> = Vec::new();
+    for rule in rules.iter().filter(|rule| {
+        rule.selectors
+            .iter()
+            .any(|selector| selector.matches(element))
+    }) {
+        for declaration in &rule.declarations {
+            declarations.push((
+                declaration.important,
+                1u32,
+                rule.specificity,
+                rule.order,
+                declaration.clone(),
+            ));
+        }
     }
 
     if let Some(inline) = element.attr("style") {
-        let base_size = style.font_size;
-        apply_declarations(&mut style, &parse_declarations(inline), base_size);
+        for declaration in parse_declarations_detailed(inline) {
+            declarations.push((declaration.important, 2u32, 0, 0, declaration));
+        }
     }
 
-    if let Some(align) = element.attr("align") {
-        style.text_align = parse_align(align).unwrap_or(style.text_align);
+    for attribute in presentational_declarations(element) {
+        declarations.push((false, 0u32, 0, 0, attribute));
     }
+
+    declarations.sort_by_key(|(important, inline, specificity, order, _)| {
+        (*important, *inline, *specificity, *order)
+    });
+
+    let values = declarations
+        .into_iter()
+        .map(|(_, _, _, _, declaration)| declaration)
+        .collect::<Vec<_>>();
+    apply_style_declarations(&mut style, &values, parent.font_size);
 
     style
 }
 
+fn presentational_declarations(element: &ElementRef) -> Vec<Declaration> {
+    let mut declarations = Vec::new();
+    for (attribute, property) in [("bgcolor", "background-color"), ("color", "color")] {
+        if let Some(value) = element.attr(attribute) {
+            declarations.push(Declaration {
+                property: property.to_string(),
+                value: value.to_string(),
+                important: false,
+            });
+        }
+    }
+    if let Some(value) = element.attr("align")
+        && let Some(align) = parse_align(value)
+    {
+        declarations.push(Declaration {
+            property: "text-align".to_string(),
+            value: align_name(align).to_string(),
+            important: false,
+        });
+    }
+    if let Some(value) = element.attr("type")
+        && let Some(list) = list_style_from_html_type(value)
+    {
+        declarations.push(Declaration {
+            property: "list-style-type".to_string(),
+            value: list_style_name(list).to_string(),
+            important: false,
+        });
+    }
+
+    declarations
+}
+
+pub fn list_style_from_html_type(value: &str) -> Option<ListStyle> {
+    let value = value.trim();
+    match value {
+        "a" => Some(ListStyle::LowerAlpha),
+        "A" => Some(ListStyle::UpperAlpha),
+        "i" => Some(ListStyle::LowerRoman),
+        "I" => Some(ListStyle::UpperRoman),
+        _ => match value.to_ascii_lowercase().as_str() {
+            "1" | "decimal" => Some(ListStyle::Decimal),
+            "disc" => Some(ListStyle::Disc),
+            "circle" => Some(ListStyle::Circle),
+            "square" => Some(ListStyle::Square),
+            _ => None,
+        },
+    }
+}
+
+fn list_style_name(style: ListStyle) -> &'static str {
+    match style {
+        ListStyle::Disc => "disc",
+        ListStyle::Circle => "circle",
+        ListStyle::Square => "square",
+        ListStyle::Decimal => "decimal",
+        ListStyle::LowerAlpha => "lower-alpha",
+        ListStyle::UpperAlpha => "upper-alpha",
+        ListStyle::LowerRoman => "lower-roman",
+        ListStyle::UpperRoman => "upper-roman",
+        ListStyle::None => "none",
+    }
+}
+
+fn align_name(align: TextAlign) -> &'static str {
+    match align {
+        TextAlign::Left => "left",
+        TextAlign::Center => "center",
+        TextAlign::Right => "right",
+        TextAlign::Justify => "justify",
+    }
+}
+
 pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], parent_size: f32) {
-    for (property, value) in declarations {
-        match property.as_str() {
+    let detailed = declarations
+        .iter()
+        .map(|(property, value)| Declaration {
+            property: property.clone(),
+            value: value.clone(),
+            important: false,
+        })
+        .collect::<Vec<_>>();
+    apply_style_declarations(style, &detailed, parent_size);
+}
+
+fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], parent_size: f32) {
+    let mut line_height_value = None;
+
+    for declaration in declarations {
+        let (property, value) = (declaration.property.as_str(), declaration.value.as_str());
+        match property {
             "color" => {
                 if let Some(color) = parse_color(value) {
                     style.color = color;
                 }
             }
             "font-size" => {
-                if let Some(length) = parse_length(value) {
-                    style.font_size = length.resolve_font(parent_size);
+                if let Some(size) = parse_font_size(value, parent_size, style.px_scale) {
+                    style.font_size = size;
                 }
             }
             "font-weight" => {
@@ -599,17 +863,13 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
                 let lower = value.to_ascii_lowercase();
                 style.italic = lower == "italic" || lower == "oblique";
             }
-            "line-height" => {
-                if let Ok(value) = value.parse::<f32>() {
-                    style.line_height = value;
-                }
-            }
+            "line-height" => line_height_value = Some(value.to_string()),
             "margin" => {
-                if let Some(length) = parse_length(value) {
-                    style.margin_top = length;
-                    style.margin_right = length;
-                    style.margin_bottom = length;
-                    style.margin_left = length;
+                if let Some([top, right, bottom, left]) = parse_box_shorthand(value) {
+                    style.margin_top = top;
+                    style.margin_right = right;
+                    style.margin_bottom = bottom;
+                    style.margin_left = left;
                 }
             }
             "margin-top" => {
@@ -654,11 +914,11 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
                 }
             }
             "padding" => {
-                if let Some(length) = parse_length(value) {
-                    style.padding_top = length;
-                    style.padding_right = length;
-                    style.padding_bottom = length;
-                    style.padding_left = length;
+                if let Some([top, right, bottom, left]) = parse_box_shorthand(value) {
+                    style.padding_top = top;
+                    style.padding_right = right;
+                    style.padding_bottom = bottom;
+                    style.padding_left = left;
                 }
             }
             "padding-top" => {
@@ -682,7 +942,7 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
                 }
             }
             "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
-                let sides = match property.as_str() {
+                let sides = match property {
                     "border-top" => [true, false, false, false],
                     "border-right" => [false, true, false, false],
                     "border-bottom" => [false, false, true, false],
@@ -704,7 +964,9 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
                             }
                         }
                     }
-                } else if let Some(spec) = parse_border(value, sides, style.font_size) {
+                } else if let Some(spec) =
+                    parse_border(value, sides, style.font_size, style.px_scale)
+                {
                     style.border = Some(spec);
                 }
             }
@@ -712,6 +974,39 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
                 if let Some(align) = parse_align(value) {
                     style.text_align = align;
                 }
+            }
+            "list-style-type" => {
+                style.list_style = match value.trim().to_ascii_lowercase().as_str() {
+                    "disc" => ListStyle::Disc,
+                    "circle" => ListStyle::Circle,
+                    "square" => ListStyle::Square,
+                    "decimal" => ListStyle::Decimal,
+                    "lower-alpha" | "lower-latin" => ListStyle::LowerAlpha,
+                    "upper-alpha" | "upper-latin" => ListStyle::UpperAlpha,
+                    "lower-roman" => ListStyle::LowerRoman,
+                    "upper-roman" => ListStyle::UpperRoman,
+                    "none" => ListStyle::None,
+                    _ => style.list_style,
+                };
+            }
+            "text-indent" => {
+                if let Some(length) = parse_length(value) {
+                    style.text_indent = length;
+                }
+            }
+            "letter-spacing" => {
+                if matches!(value.trim().to_ascii_lowercase().as_str(), "normal") {
+                    style.letter_spacing = Length::default();
+                } else if let Some(length) = parse_length(value) {
+                    style.letter_spacing = length;
+                }
+            }
+            "white-space" => {
+                style.white_space = match value.trim().to_ascii_lowercase().as_str() {
+                    "pre" | "pre-line" => WhiteSpace::Pre,
+                    "nowrap" => WhiteSpace::Nowrap,
+                    _ => WhiteSpace::Normal,
+                };
             }
             "display" => {
                 style.display = match value.to_ascii_lowercase().as_str() {
@@ -723,13 +1018,19 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
             _ => {}
         }
     }
+
+    if let Some(value) = line_height_value
+        && let Some(height) = parse_line_height(&value, style.font_size, style.px_scale)
+    {
+        style.line_height = height;
+    }
 }
 
 impl Length {
-    fn resolve_font(self, parent_size: f32) -> f32 {
+    fn resolve_font(self, parent_size: f32, scale: f32) -> f32 {
         match self.unit {
             Unit::Pt => self.value,
-            Unit::Px => self.value * 0.75,
+            Unit::Px => self.value * scale,
             Unit::Em => self.value * parent_size,
             Unit::In => self.value * 72.0,
             Unit::Cm => self.value * 72.0 / 2.54,
@@ -739,13 +1040,73 @@ impl Length {
     }
 }
 
+fn parse_box_shorthand(input: &str) -> Option<[Length; 4]> {
+    let values = input
+        .split_whitespace()
+        .map(parse_length)
+        .collect::<Option<Vec<_>>>()?;
+
+    match values.len() {
+        1 => Some([values[0]; 4]),
+        2 => Some([values[0], values[1], values[0], values[1]]),
+        3 => Some([values[0], values[1], values[2], values[1]]),
+        4 => Some([values[0], values[1], values[2], values[3]]),
+        _ => None,
+    }
+}
+
+fn parse_font_size(input: &str, parent_size: f32, scale: f32) -> Option<f32> {
+    let text = input.trim().to_ascii_lowercase();
+    let scale = match text.as_str() {
+        "xx-small" => 0.6,
+        "x-small" => 0.75,
+        "small" => 0.89,
+        "medium" => 1.0,
+        "large" => 1.2,
+        "x-large" => 1.5,
+        "xx-large" => 2.0,
+        "xxx-large" => 3.0,
+        "smaller" => 1.0 / 1.2,
+        "larger" => 1.2,
+        "inherit" => return None,
+        _ => {
+            let length = parse_length(&text)?;
+            return Some(length.resolve_font(parent_size, scale).max(0.0));
+        }
+    };
+
+    Some(parent_size * scale)
+}
+
+fn parse_line_height(input: &str, font_size: f32, scale: f32) -> Option<f32> {
+    let text = input.trim().to_ascii_lowercase();
+    if text == "normal" {
+        return Some(1.2);
+    }
+    if let Ok(factor) = text.parse::<f32>() {
+        return (factor > 0.0).then_some(factor);
+    }
+
+    let length = parse_length(&text)?;
+    let height = length.resolve_font(font_size, scale) / font_size;
+    (height.is_finite() && height > 0.0).then_some(height)
+}
+
 fn style_for_tag(tag: &str, parent: &Style) -> Style {
     let mut style = Style::inherited(parent);
 
     match tag {
         "html" | "body" | "div" | "section" | "article" | "header" | "footer" | "main"
-        | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "ul" | "ol" | "li" => {
+        | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "li" => {
             style.display = Display::Block;
+        }
+        "ul" => {
+            style.display = Display::Block;
+            style.list_style = ListStyle::Disc;
+        }
+        "ol" => {
+            style.display = Display::Block;
+            style.list_style = ListStyle::Decimal;
         }
         "p" => {
             style.display = Display::Block;
@@ -788,7 +1149,7 @@ fn style_for_tag(tag: &str, parent: &Style) -> Style {
     style
 }
 
-fn parse_length(input: &str) -> Option<Length> {
+pub fn parse_length(input: &str) -> Option<Length> {
     let text = input.trim().to_ascii_lowercase();
     let (value, unit) = if let Some(value) = text.strip_suffix("px") {
         (value, Unit::Px)
@@ -815,7 +1176,7 @@ fn parse_length(input: &str) -> Option<Length> {
         .map(|value| Length { value, unit })
 }
 
-fn parse_border(input: &str, sides: [bool; 4], font_size: f32) -> Option<BorderSpec> {
+fn parse_border(input: &str, sides: [bool; 4], font_size: f32, scale: f32) -> Option<BorderSpec> {
     let mut width = None;
     let mut color = None;
 
@@ -823,7 +1184,7 @@ fn parse_border(input: &str, sides: [bool; 4], font_size: f32) -> Option<BorderS
         if width.is_none()
             && let Some(length) = parse_length(token)
         {
-            width = Some(length.resolve(font_size));
+            width = Some(length.resolve_with(font_size, scale));
             continue;
         }
         if color.is_none()
@@ -848,63 +1209,302 @@ fn parse_align(input: &str) -> Option<TextAlign> {
         "left" => Some(TextAlign::Left),
         "center" => Some(TextAlign::Center),
         "right" => Some(TextAlign::Right),
+        "justify" => Some(TextAlign::Justify),
         _ => None,
     }
 }
 
-fn parse_color(input: &str) -> Option<[f32; 3]> {
+pub fn parse_color(input: &str) -> Option<[f32; 3]> {
     let text = input.trim().to_ascii_lowercase();
 
     if let Some(hex) = text.strip_prefix('#') {
-        return match hex.len() {
-            3 => {
-                let r = hex.get(0..1)?.parse::<u8>().ok()?;
-                let g = hex.get(1..2)?.parse::<u8>().ok()?;
-                let b = hex.get(2..3)?.parse::<u8>().ok()?;
-                Some([
-                    r as f32 * 17.0 / 255.0,
-                    g as f32 * 17.0 / 255.0,
-                    b as f32 * 17.0 / 255.0,
-                ])
-            }
-            6 => {
-                let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
-                let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
-                let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
-                Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
-            }
-            _ => None,
-        };
+        return parse_hex_color(hex);
     }
 
-    if let Some(inner) = text.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        let parts = inner
-            .split(',')
-            .map(|part| part.trim().trim_end_matches('%').parse::<f32>().ok())
-            .collect::<Option<Vec<_>>>()?;
-        if parts.len() == 3 {
-            let scale = if inner.contains('%') { 100.0 } else { 255.0 };
-            return Some([parts[0] / scale, parts[1] / scale, parts[2] / scale]);
+    if !text.contains('(') {
+        return named_color(&text);
+    }
+
+    let (name, arguments) = text.split_once('(')?;
+    let arguments = arguments.strip_suffix(')')?;
+
+    match name.trim() {
+        "rgb" | "rgba" => parse_rgb_color(arguments),
+        "hsl" | "hsla" => parse_hsl_color(arguments),
+        "cmyk" => parse_cmyk_color(arguments),
+        _ => None,
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Option<[f32; 3]> {
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let digits = match hex.len() {
+        3 | 4 => hex.chars().take(3).flat_map(|c| [c, c]).collect::<String>(),
+        6 | 8 => hex[..6].to_string(),
+        _ => return None,
+    };
+    let value = u32::from_str_radix(&digits, 16).ok()?;
+
+    Some([
+        ((value >> 16) & 0xff) as f32 / 255.0,
+        ((value >> 8) & 0xff) as f32 / 255.0,
+        (value & 0xff) as f32 / 255.0,
+    ])
+}
+
+fn split_color_channels(input: &str) -> Option<(Vec<String>, Option<String>)> {
+    let input = input.trim();
+
+    if input.contains(',') {
+        let parts = input.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 3 && parts.len() != 4 {
+            return None;
         }
+        let channels = parts[..3].iter().map(|part| (*part).to_string()).collect();
+        let alpha = parts.get(3).map(|part| (*part).to_string());
+        return Some((channels, alpha));
     }
 
-    let named = match text.as_str() {
-        "black" => [0.0, 0.0, 0.0],
-        "white" => [1.0, 1.0, 1.0],
-        "red" => [1.0, 0.0, 0.0],
-        "green" => [0.0, 0.5, 0.0],
-        "blue" => [0.0, 0.0, 1.0],
-        "yellow" => [1.0, 1.0, 0.0],
-        "orange" => [1.0, 0.65, 0.0],
-        "purple" => [0.5, 0.0, 0.5],
-        "teal" => [0.0, 0.5, 0.5],
-        "navy" => [0.0, 0.0, 0.5],
-        "gray" | "grey" => [0.5, 0.5, 0.5],
-        "silver" => [0.75, 0.75, 0.75],
+    let (values, alpha) = match input.split_once('/') {
+        Some((values, alpha)) => (values, Some(alpha.trim().to_string())),
+        None => (input, None),
+    };
+    let channels = values
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (channels.len() == 3).then_some((channels, alpha))
+}
+
+fn parse_byte_channel(token: &str) -> Option<f32> {
+    let value = if let Some(percent) = token.trim().strip_suffix('%') {
+        percent.trim().parse::<f32>().ok()? * 2.55
+    } else {
+        token.trim().parse::<f32>().ok()?
+    };
+
+    Some(value.clamp(0.0, 255.0) / 255.0)
+}
+
+fn parse_fraction(token: &str) -> Option<f32> {
+    let value = token.trim().trim_end_matches('%').parse::<f32>().ok()?;
+    let fraction = if token.contains('%') || value > 1.0 {
+        value / 100.0
+    } else {
+        value
+    };
+
+    Some(fraction.clamp(0.0, 1.0))
+}
+
+fn parse_rgb_color(input: &str) -> Option<[f32; 3]> {
+    let (channels, _alpha) = split_color_channels(input)?;
+    let mut rgb = [0.0; 3];
+    for (slot, channel) in rgb.iter_mut().zip(channels) {
+        *slot = parse_byte_channel(&channel)?;
+    }
+
+    Some(rgb)
+}
+
+fn parse_hsl_color(input: &str) -> Option<[f32; 3]> {
+    let (channels, _alpha) = split_color_channels(input)?;
+    let hue = channels[0]
+        .trim()
+        .trim_end_matches("deg")
+        .parse::<f32>()
+        .ok()?
+        .rem_euclid(360.0);
+    let saturation = parse_fraction(&channels[1])?;
+    let lightness = parse_fraction(&channels[2])?;
+
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let second = chroma * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let match_value = lightness - chroma / 2.0;
+    let (red, green, blue) = match (hue / 60.0) as u32 % 6 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+
+    Some([
+        (red + match_value).clamp(0.0, 1.0),
+        (green + match_value).clamp(0.0, 1.0),
+        (blue + match_value).clamp(0.0, 1.0),
+    ])
+}
+
+fn parse_cmyk_color(input: &str) -> Option<[f32; 3]> {
+    let parts = input.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+
+    let mut values = [0.0; 4];
+    for (slot, part) in values.iter_mut().zip(parts) {
+        *slot = parse_fraction(part)?;
+    }
+    let key = values[3];
+
+    Some([
+        (1.0 - values[0]) * (1.0 - key),
+        (1.0 - values[1]) * (1.0 - key),
+        (1.0 - values[2]) * (1.0 - key),
+    ])
+}
+
+fn named_color(name: &str) -> Option<[f32; 3]> {
+    let hex = match name {
+        "aliceblue" => "f0f8ff",
+        "antiquewhite" => "faebd7",
+        "aqua" => "00ffff",
+        "aquamarine" => "7fffd4",
+        "azure" => "f0ffff",
+        "beige" => "f5f5dc",
+        "bisque" => "ffe4c4",
+        "black" => "000000",
+        "blanchedalmond" => "ffebcd",
+        "blue" => "0000ff",
+        "blueviolet" => "8a2be2",
+        "brown" => "a52a2a",
+        "burlywood" => "deb887",
+        "cadetblue" => "5f9ea0",
+        "chartreuse" => "7fff00",
+        "chocolate" => "d2691e",
+        "coral" => "ff7f50",
+        "cornflowerblue" => "6495ed",
+        "cornsilk" => "fff8dc",
+        "crimson" => "dc143c",
+        "cyan" => "00ffff",
+        "darkblue" => "00008b",
+        "darkcyan" => "008b8b",
+        "darkgoldenrod" => "b8860b",
+        "darkgray" | "darkgrey" => "a9a9a9",
+        "darkgreen" => "006400",
+        "darkkhaki" => "bdb76b",
+        "darkmagenta" => "8b008b",
+        "darkolivegreen" => "556b2f",
+        "darkorange" => "ff8c00",
+        "darkorchid" => "9932cc",
+        "darkred" => "8b0000",
+        "darksalmon" => "e9967a",
+        "darkseagreen" => "8fbc8f",
+        "darkslateblue" => "483d8b",
+        "darkslategray" | "darkslategrey" => "2f4f4f",
+        "darkturquoise" => "00ced1",
+        "darkviolet" => "9400d3",
+        "deeppink" => "ff1493",
+        "deepskyblue" => "00bfff",
+        "dimgray" | "dimgrey" => "696969",
+        "dodgerblue" => "1e90ff",
+        "firebrick" => "b22222",
+        "floralwhite" => "fffaf0",
+        "forestgreen" => "228b22",
+        "fuchsia" => "ff00ff",
+        "gainsboro" => "dcdcdc",
+        "ghostwhite" => "f8f8ff",
+        "gold" => "ffd700",
+        "goldenrod" => "daa520",
+        "gray" | "grey" => "808080",
+        "green" => "008000",
+        "greenyellow" => "adff2f",
+        "honeydew" => "f0fff0",
+        "hotpink" => "ff69b4",
+        "indianred" => "cd5c5c",
+        "indigo" => "4b0082",
+        "ivory" => "fffff0",
+        "khaki" => "f0e68c",
+        "lavender" => "e6e6fa",
+        "lavenderblush" => "fff0f5",
+        "lawngreen" => "7cfc00",
+        "lemonchiffon" => "fffacd",
+        "lightblue" => "add8e6",
+        "lightcoral" => "f08080",
+        "lightcyan" => "e0ffff",
+        "lightgoldenrodyellow" => "fafad2",
+        "lightgray" | "lightgrey" => "d3d3d3",
+        "lightgreen" => "90ee90",
+        "lightpink" => "ffb6c1",
+        "lightsalmon" => "ffa07a",
+        "lightseagreen" => "20b2aa",
+        "lightskyblue" => "87cefa",
+        "lightslategray" | "lightslategrey" => "778899",
+        "lightsteelblue" => "b0c4de",
+        "lightyellow" => "ffffe0",
+        "lime" => "00ff00",
+        "limegreen" => "32cd32",
+        "linen" => "faf0e6",
+        "magenta" => "ff00ff",
+        "maroon" => "800000",
+        "mediumaquamarine" => "66cdaa",
+        "mediumblue" => "0000cd",
+        "mediumorchid" => "ba55d3",
+        "mediumpurple" => "9370db",
+        "mediumseagreen" => "3cb371",
+        "mediumslateblue" => "7b68ee",
+        "mediumspringgreen" => "00fa9a",
+        "mediumturquoise" => "48d1cc",
+        "mediumvioletred" => "c71585",
+        "midnightblue" => "191970",
+        "mintcream" => "f5fffa",
+        "mistyrose" => "ffe4e1",
+        "moccasin" => "ffe4b5",
+        "navajowhite" => "ffdead",
+        "navy" => "000080",
+        "oldlace" => "fdf5e6",
+        "olive" => "808000",
+        "olivedrab" => "6b8e23",
+        "orange" => "ffa500",
+        "orangered" => "ff4500",
+        "orchid" => "da70d6",
+        "palegoldenrod" => "eee8aa",
+        "palegreen" => "98fb98",
+        "paleturquoise" => "afeeee",
+        "palevioletred" => "db7093",
+        "papayawhip" => "ffefd5",
+        "peachpuff" => "ffdab9",
+        "peru" => "cd853f",
+        "pink" => "ffc0cb",
+        "plum" => "dda0dd",
+        "powderblue" => "b0e0e6",
+        "purple" => "800080",
+        "red" => "ff0000",
+        "rosybrown" => "bc8f8f",
+        "royalblue" => "4169e1",
+        "saddlebrown" => "8b4513",
+        "salmon" => "fa8072",
+        "sandybrown" => "f4a460",
+        "seagreen" => "2e8b57",
+        "seashell" => "fff5ee",
+        "sienna" => "a0522d",
+        "silver" => "c0c0c0",
+        "skyblue" => "87ceeb",
+        "slateblue" => "6a5acd",
+        "slategray" | "slategrey" => "708090",
+        "snow" => "fffafa",
+        "springgreen" => "00ff7f",
+        "steelblue" => "4682b4",
+        "tan" => "d2b48c",
+        "teal" => "008080",
+        "thistle" => "d8bfd8",
+        "tomato" => "ff6347",
+        "turquoise" => "40e0d0",
+        "violet" => "ee82ee",
+        "wheat" => "f5deb3",
+        "white" => "ffffff",
+        "whitesmoke" => "f5f5f5",
+        "yellow" => "ffff00",
+        "yellowgreen" => "9acd32",
         _ => return None,
     };
 
-    Some(named)
+    parse_hex_color(hex)
 }
 
 fn specificity(selector: &str) -> u32 {

@@ -4,7 +4,7 @@ use pdf_writer::types::{
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
 use crate::css::TextAlign;
-use crate::layout::{Document, FontId, InlineItem, Page, measure};
+use crate::layout::{Document, FontId, InlineItem, Page};
 
 struct FontRefs {
     type0: Ref,
@@ -250,7 +250,7 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
 
     for line in &page.lines {
         let x = match line.align {
-            TextAlign::Left => document.margin,
+            TextAlign::Left | TextAlign::Justify => document.margin,
             TextAlign::Center => {
                 document.margin + (document.width - 2.0 * document.margin - line.width) / 2.0
             }
@@ -310,35 +310,56 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
             .fold(0.0f32, f32::max);
         let baseline = line_y + line.height - max_size * 0.18;
         let mut cursor = x;
+        let extra_per_space = if line.align == TextAlign::Justify {
+            let gaps = line
+                .items
+                .iter()
+                .filter(|item| matches!(item, InlineItem::Text(run) if run.text == " "))
+                .count();
+            if gaps == 0 {
+                0.0
+            } else {
+                let available = document.width - 2.0 * document.margin - line.left;
+                (available - line.width) / gaps as f32
+            }
+        } else {
+            0.0
+        };
 
         for item in &line.items {
             match item {
                 InlineItem::Text(run) => {
                     let name = font_resource(run.font);
-                    let (bytes, width) = match run.font {
-                        FontId::Builtin(_) => (
-                            to_win_ansi(&run.text),
-                            measure(&run.text, run.size, run.font, &document.fonts),
-                        ),
-                        FontId::Embedded(index) => {
-                            let font = &document.fonts[index];
-                            (
-                                to_cids(&run.text, font),
-                                measure(&run.text, run.size, run.font, &document.fonts),
-                            )
-                        }
+                    let bytes = match run.font {
+                        FontId::Builtin(_) => to_win_ansi(&run.text),
+                        FontId::Embedded(index) => to_cids(&run.text, &document.fonts[index]),
                     };
 
                     if bytes.is_empty() {
                         continue;
                     }
 
+                    let spacing = run.spacing
+                        + if run.text == " " {
+                            extra_per_space
+                        } else {
+                            0.0
+                        };
+                    let width = run.width
+                        + if run.text == " " {
+                            extra_per_space
+                        } else {
+                            0.0
+                        };
+
                     content
                         .begin_text()
+                        .set_char_spacing(spacing)
                         .set_text_matrix([1.0, 0.0, 0.0, 1.0, cursor, baseline])
                         .set_font(Name(name.as_slice()), run.size)
                         .set_fill_rgb(run.color[0], run.color[1], run.color[2])
                         .show(Str(bytes.as_slice()))
+                        .set_char_spacing(0.0)
                         .end_text();
 
                     if run.underline {

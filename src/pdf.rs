@@ -39,7 +39,51 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
     let info_id = Ref::new(next_id);
     next_id += 1;
 
-    pdf.catalog(catalog_id).pages(pages_id);
+    let page_ids = (0..document.pages.len())
+        .map(|_| {
+            let id = Ref::new(next_id);
+            next_id += 1;
+            id
+        })
+        .collect::<Vec<_>>();
+    let content_ids = (0..document.pages.len())
+        .map(|_| {
+            let id = Ref::new(next_id);
+            next_id += 1;
+            id
+        })
+        .collect::<Vec<_>>();
+    let destinations_id = Ref::new(next_id);
+    next_id += 1;
+    let destinations = document
+        .anchors
+        .iter()
+        .filter_map(|anchor| {
+            let geometry = document.pages.get(anchor.page)?.geometry;
+            Some((
+                anchor.name.clone(),
+                anchor.page,
+                geometry.height - anchor.top,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    {
+        let mut dictionary = pdf.destinations(destinations_id);
+        for (name, page_index, top) in &destinations {
+            dictionary
+                .insert(Name(name.as_bytes()))
+                .page(page_ids[*page_index])
+                .xyz(0.0, *top, Some(0.0));
+        }
+    }
+    {
+        let mut catalog = pdf.catalog(catalog_id);
+        catalog.pages(pages_id);
+        if !destinations.is_empty() {
+            catalog.destinations(destinations_id);
+        }
+    }
 
     let mut info = pdf.document_info(info_id);
     info.creator(TextStr("html2pdf-rs"))
@@ -82,16 +126,11 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         write_embedded_font(&mut pdf, font, refs);
     }
 
-    let mut page_ids = Vec::with_capacity(document.pages.len());
+    for (page_index, page) in document.pages.iter().enumerate() {
+        let page_id = page_ids[page_index];
+        let content_id = content_ids[page_index];
 
-    for page in &document.pages {
-        let page_id = Ref::new(next_id);
-        next_id += 1;
-        let content_id = Ref::new(next_id);
-        next_id += 1;
-        page_ids.push(page_id);
-
-        let content = build_content(page, document);
+        let content = build_content(page, document, page_index, document.pages.len());
         pdf.stream(content_id, content.as_slice()).finish();
 
         let mut links = Vec::new();
@@ -99,7 +138,29 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             for link in &line.links {
                 let link_id = Ref::new(next_id);
                 next_id += 1;
-                write_link(&mut pdf, link_id, page_id, &page.geometry, line, link);
+                let target = link.uri.strip_prefix('#').and_then(|fragment| {
+                    document
+                        .anchors
+                        .iter()
+                        .find(|anchor| anchor.name == fragment)
+                        .and_then(|anchor| {
+                            page_ids.get(anchor.page).map(|&target_page_id| {
+                                (
+                                    target_page_id,
+                                    document.pages[anchor.page].geometry.height - anchor.top,
+                                )
+                            })
+                        })
+                });
+                write_link(
+                    &mut pdf,
+                    link_id,
+                    page_id,
+                    &page.geometry,
+                    line,
+                    link,
+                    target,
+                );
                 links.push(link_id);
             }
         }
@@ -212,6 +273,7 @@ fn write_link(
     geometry: &crate::layout::PageGeometry,
     line: &crate::layout::Line,
     link: &crate::layout::LinkRect,
+    target: Option<(Ref, f32)>,
 ) {
     let x = geometry.margin + line.left + link.x;
     let top = geometry.height - geometry.margin - line.top;
@@ -222,10 +284,20 @@ fn write_link(
         .subtype(AnnotationType::Link)
         .rect(Rect::new(x, bottom, x + link.width, top))
         .page(page_id);
-    annotation
-        .action()
-        .action_type(ActionType::Uri)
-        .uri(Str(link.uri.as_bytes()));
+    {
+        let mut action = annotation.action();
+        if let Some((target_page_id, target_top)) = target {
+            action
+                .action_type(ActionType::GoTo)
+                .destination()
+                .page(target_page_id)
+                .xyz(0.0, target_top, Some(0.0));
+        } else {
+            action
+                .action_type(ActionType::Uri)
+                .uri(Str(link.uri.as_bytes()));
+        }
+    }
     annotation.finish();
 }
 
@@ -245,7 +317,12 @@ fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
     bytes
 }
 
-fn build_content(page: &Page, document: &Document) -> Vec<u8> {
+fn build_content(
+    page: &Page,
+    document: &Document,
+    page_index: usize,
+    page_count: usize,
+) -> Vec<u8> {
     let mut content = Content::new();
     let width = page.geometry.width;
     let height = page.geometry.height;
@@ -361,14 +438,23 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
                         .set_char_spacing(0.0)
                         .end_text();
 
-                    if run.underline {
-                        let underline_y = baseline - run.size * 0.12;
+                    let decorations = [
+                        (run.underline, baseline - run.size * 0.12),
+                        (run.line_through, baseline - run.size * 0.32),
+                        (run.overline, baseline + run.size * 0.78),
+                    ];
+                    if decorations.iter().any(|(enabled, _)| *enabled) {
                         content
                             .set_stroke_rgb(run.color[0], run.color[1], run.color[2])
-                            .set_line_width(0.6)
-                            .move_to(cursor, underline_y)
-                            .line_to(cursor + width, underline_y)
-                            .stroke();
+                            .set_line_width(0.6);
+                        for (enabled, y) in decorations {
+                            if enabled {
+                                content
+                                    .move_to(cursor, y)
+                                    .line_to(cursor + width, y)
+                                    .stroke();
+                            }
+                        }
                     }
 
                     cursor += width;
@@ -387,6 +473,39 @@ fn build_content(page: &Page, document: &Document) -> Vec<u8> {
                     cursor += image.width;
                 }
             }
+        }
+    }
+
+    if let Some(template) = &document.page_text {
+        let text = template
+            .replace("{PAGE_NUM}", &(page_index + 1).to_string())
+            .replace("{PAGE_COUNT}", &page_count.to_string());
+        let bytes = to_win_ansi(&text);
+        if !bytes.is_empty() {
+            let text_width = bytes.len() as f32 * 4.5;
+            let (x, y) = match document.page_text_location {
+                crate::PageTextLocation::TopLeft => (margin, height - margin * 0.5),
+                crate::PageTextLocation::TopCenter => {
+                    ((width - text_width) / 2.0, height - margin * 0.5)
+                }
+                crate::PageTextLocation::TopRight => {
+                    (width - margin - text_width, height - margin * 0.5)
+                }
+                crate::PageTextLocation::BottomLeft => (margin, margin * 0.35),
+                crate::PageTextLocation::BottomCenter => {
+                    ((width - text_width) / 2.0, margin * 0.35)
+                }
+                crate::PageTextLocation::BottomRight => {
+                    (width - margin - text_width, margin * 0.35)
+                }
+            };
+            content
+                .begin_text()
+                .set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y])
+                .set_font(Name(b"F1"), 9.0)
+                .set_fill_rgb(0.4, 0.4, 0.4)
+                .show(Str(bytes.as_slice()))
+                .end_text();
         }
     }
 

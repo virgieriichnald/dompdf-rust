@@ -17,6 +17,10 @@ fn help() {
     println!("  --remote       Allow remote CSS/font/image URLs");
     println!("  --allow-host HOST  Restrict remote URLs to this host (repeatable)");
     println!("  --chroot DIR   Confine local resources to DIR");
+    println!("  --page-text TEXT  Overlay text; supports {{PAGE_NUM}} and {{PAGE_COUNT}}");
+    println!(
+        "  --page-text-location POS  top-left|top-center|top-right|bottom-left|bottom-center|bottom-right"
+    );
     println!("  --help         Show this help");
 }
 
@@ -97,6 +101,27 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                     io::Error::new(io::ErrorKind::InvalidInput, "--chroot needs a value")
                 })?;
                 options = options.chroot(&value);
+            }
+            "--page-text" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--page-text needs a value")
+                })?;
+                options = options.page_text(&value);
+            }
+            "--page-text-location" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--page-text-location needs a value",
+                    )
+                })?;
+                let location = html2pdf_rs::PageTextLocation::parse(&value).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid page text location: {value}"),
+                    )
+                })?;
+                options = options.page_text_location(location);
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(

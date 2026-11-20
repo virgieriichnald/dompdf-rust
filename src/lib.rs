@@ -9,6 +9,35 @@ pub mod css;
 pub mod layout;
 pub mod pdf;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageTextLocation {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl PageTextLocation {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
+            "topleft" => Some(Self::TopLeft),
+            "topcenter" => Some(Self::TopCenter),
+            "topright" => Some(Self::TopRight),
+            "bottomleft" => Some(Self::BottomLeft),
+            "bottomcenter" => Some(Self::BottomCenter),
+            "bottomright" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResourcePolicy {
     pub remote_enabled: bool,
@@ -119,6 +148,8 @@ pub struct Options {
     pub dpi: f32,
     pub image_byte_limit: Option<usize>,
     pub resource: ResourcePolicy,
+    pub page_text: Option<String>,
+    pub page_text_location: PageTextLocation,
 }
 
 impl Default for Options {
@@ -131,6 +162,8 @@ impl Default for Options {
             dpi: crate::css::DEFAULT_DPI,
             image_byte_limit: None,
             resource: ResourcePolicy::default(),
+            page_text: None,
+            page_text_location: PageTextLocation::BottomCenter,
         }
     }
 }
@@ -184,6 +217,16 @@ impl Options {
 
     pub fn chroot(mut self, path: &str) -> Self {
         self.resource = self.resource.chroot(path);
+        self
+    }
+
+    pub fn page_text(mut self, text: &str) -> Self {
+        self.page_text = Some(text.to_string());
+        self
+    }
+
+    pub fn page_text_location(mut self, location: PageTextLocation) -> Self {
+        self.page_text_location = location;
         self
     }
 }

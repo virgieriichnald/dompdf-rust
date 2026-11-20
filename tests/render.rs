@@ -526,3 +526,63 @@ fn resolves_css_variables_and_calc() {
     assert!(raw.contains("1 0 0 rg"));
     assert!(raw.contains("24 Tf"));
 }
+
+#[test]
+fn renders_text_decorations() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>p { text-decoration: line-through overline }</style><p>Teks</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(Teks) Tj"));
+    assert!(raw.matches(" l\nS").count() >= 2);
+}
+
+#[test]
+fn writes_internal_anchor_destinations() {
+    let pdf =
+        html2pdf_rs::render_html("<a href=\"#tujuan\">Ke tujuan</a><h2 id=\"tujuan\">Tujuan</h2>");
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/Dests"));
+    assert!(raw.contains("/GoTo"));
+    assert!(raw.contains("tujuan"));
+    assert!(raw.contains("/XYZ"));
+}
+
+#[test]
+fn overlays_page_text_with_tokens() {
+    use html2pdf_rs::{Options, PageTextLocation};
+    use std::path::Path;
+
+    let options = Options::default()
+        .page_text("Hal {PAGE_NUM}/{PAGE_COUNT}")
+        .page_text_location(PageTextLocation::BottomRight);
+    let pdf = html2pdf_rs::render_html_with_options("<p>Isi</p>", Path::new("."), &options);
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(Hal 1/1)"));
+}
+
+#[test]
+fn renders_pseudo_element_generated_content() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>.item::before { content: '>> ' }\
+         .item::after { content: attr(data-suffix) }</style>\
+         <p class=\"item\" data-suffix=\" <<\">Tengah</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(>>)"));
+    assert!(raw.contains("(Tengah)"));
+    assert!(raw.contains("(<<)"));
+}
+
+#[test]
+fn applies_relative_positioning_offsets() {
+    let pdf =
+        html2pdf_rs::render_html("<div style=\"position:relative;left:40pt;top:10pt\">Geser</div>");
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("1 0 0 1 94 "));
+}

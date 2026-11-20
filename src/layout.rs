@@ -5,11 +5,11 @@ use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
 use crate::css::{
-    BorderSpec, Display, FontFace, ListStyle, MediaContext, PageRules, Rule, Style, TextAlign,
-    WhiteSpace, parse_color, parse_font_faces, parse_length, parse_page_rules, parse_styles,
-    px_scale, style_for,
+    BorderSpec, Display, FontFace, ListStyle, MediaContext, PageRules, Position, PseudoElement,
+    Rule, Style, TextAlign, WhiteSpace, parse_color, parse_font_faces, parse_length,
+    parse_page_rules, parse_styles, pseudo_style_for, px_scale, style_for,
 };
-use crate::{Options, ResourcePolicy, read_bytes};
+use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
 const HELVETICA_WIDTHS: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
@@ -60,6 +60,8 @@ pub struct Run {
     pub size: f32,
     pub color: [f32; 3],
     pub underline: bool,
+    pub overline: bool,
+    pub line_through: bool,
     pub link: Option<String>,
     pub spacing: f32,
     pub width: f32,
@@ -84,6 +86,13 @@ pub struct LinkRect {
     pub x: f32,
     pub width: f32,
     pub uri: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Anchor {
+    pub name: String,
+    pub page: usize,
+    pub top: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -146,12 +155,15 @@ pub struct Metadata {
 #[derive(Clone, Debug)]
 pub struct Document {
     pub pages: Vec<Page>,
+    pub anchors: Vec<Anchor>,
     pub images: Vec<ImageAsset>,
     pub fonts: Vec<EmbeddedFont>,
     pub metadata: Metadata,
     pub width: f32,
     pub height: f32,
     pub margin: f32,
+    pub page_text: Option<String>,
+    pub page_text_location: PageTextLocation,
 }
 
 impl Document {
@@ -225,12 +237,15 @@ impl Document {
 
         Document {
             pages: collector.pages,
+            anchors: collector.anchors,
             images: collector.images,
             fonts: collector.fonts,
             metadata,
             width: options.width,
             height: options.height,
             margin: options.margin,
+            page_text: options.page_text.clone(),
+            page_text_location: options.page_text_location,
         }
     }
 }
@@ -321,6 +336,7 @@ struct ListState {
 
 struct Collector {
     pages: Vec<Page>,
+    anchors: Vec<Anchor>,
     current: Vec<InlineItem>,
     width: f32,
     height: f32,
@@ -329,6 +345,9 @@ struct Collector {
     page_name: Option<String>,
     pending_before: f32,
     pending_indent: f32,
+    offset_x: f32,
+    offset_y: f32,
+    offset_stack: Vec<(f32, f32)>,
     align: TextAlign,
     max_width: f32,
     page_height: f32,
@@ -364,6 +383,7 @@ impl Collector {
                 lines: Vec::new(),
                 geometry,
             }],
+            anchors: Vec::new(),
             current: Vec::new(),
             width: 0.0,
             height: 0.0,
@@ -372,6 +392,9 @@ impl Collector {
             page_name: None,
             pending_before: 0.0,
             pending_indent: 0.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            offset_stack: Vec::new(),
             align: TextAlign::Left,
             max_width: content_width,
             page_height: content_height,
@@ -445,8 +468,8 @@ impl Collector {
         }
 
         self.cursor += line.space_before;
-        line.top = self.cursor;
-        line.left = self.pending_indent;
+        line.top = self.cursor + self.offset_y;
+        line.left = self.pending_indent + self.offset_x;
         self.pending_indent = 0.0;
         self.cursor += line.height + line.space_after;
         self.push_line(line);
@@ -491,6 +514,27 @@ impl Collector {
     fn start_block(&mut self, style: &Style) {
         self.flush_line();
         self.style_stack.push((self.background, self.border));
+        self.offset_stack.push((self.offset_x, self.offset_y));
+        if style.position == Position::Relative {
+            let dx = if let Some(left) = style.offset_left {
+                left.resolve_with(style.font_size, style.px_scale)
+            } else {
+                style
+                    .offset_right
+                    .map(|right| -right.resolve_with(style.font_size, style.px_scale))
+                    .unwrap_or(0.0)
+            };
+            let dy = if let Some(top) = style.offset_top {
+                top.resolve_with(style.font_size, style.px_scale)
+            } else {
+                style
+                    .offset_bottom
+                    .map(|bottom| -bottom.resolve_with(style.font_size, style.px_scale))
+                    .unwrap_or(0.0)
+            };
+            self.offset_x += dx;
+            self.offset_y += dy;
+        }
         if style.background.is_some() {
             self.background = style.background;
         }
@@ -512,6 +556,10 @@ impl Collector {
         if let Some((background, border)) = self.style_stack.pop() {
             self.background = background;
             self.border = border;
+        }
+        if let Some((x, y)) = self.offset_stack.pop() {
+            self.offset_x = x;
+            self.offset_y = y;
         }
     }
 
@@ -619,6 +667,8 @@ impl Collector {
             size: style.font_size,
             color: style.color,
             underline: style.underline,
+            overline: style.overline,
+            line_through: style.line_through,
             link: self.link.clone(),
             spacing: style.letter_spacing_pt(),
             width,
@@ -887,6 +937,42 @@ fn dec2roman(value: i64) -> String {
     roman
 }
 
+fn resolve_generated_content(input: &str, element: &ElementRef) -> Option<String> {
+    let mut output = String::new();
+    let mut rest = input.trim();
+
+    while !rest.is_empty() {
+        let quote = rest.chars().next()?;
+        if quote == '"' || quote == '\'' {
+            let Some(end) = rest[1..].find(quote) else {
+                break;
+            };
+            output.push_str(&rest[1..end + 1]);
+            rest = rest[end + 2..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("attr(") {
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            let name = after[..end].trim().trim_matches(['"', '\'']);
+            if let Some(value) = element.attr(name) {
+                output.push_str(value);
+            }
+            rest = after[end + 1..].trim_start();
+        } else if rest.starts_with("open-quote") {
+            output.push('“');
+            rest = rest["open-quote".len()..].trim_start();
+        } else if rest.starts_with("close-quote") {
+            output.push('”');
+            rest = rest["close-quote".len()..].trim_start();
+        } else {
+            output.push(quote);
+            rest = rest[quote.len_utf8()..].trim_start();
+        }
+    }
+
+    (!output.is_empty()).then_some(output)
+}
+
 fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Collector) {
     let tag = element.value().name();
 
@@ -921,6 +1007,19 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             right: true,
             bottom: true,
             left: true,
+        });
+    }
+
+    if let Some(name) = element
+        .attr("id")
+        .or_else(|| element.attr("name"))
+        .filter(|name| !name.is_empty())
+        && !collector.anchors.iter().any(|anchor| anchor.name == name)
+    {
+        collector.anchors.push(Anchor {
+            name: name.to_string(),
+            page: collector.pages.len() - 1,
+            top: collector.cursor,
         });
     }
 
@@ -1013,12 +1112,31 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         collector.push_text(&prefix, &style);
     }
 
+    let before_style = pseudo_style_for(&element, &style, rules, PseudoElement::Before);
+    let after_style = pseudo_style_for(&element, &style, rules, PseudoElement::After);
+    let before_content = before_style
+        .content
+        .as_deref()
+        .and_then(|content| resolve_generated_content(content, &element));
+    let after_content = after_style
+        .content
+        .as_deref()
+        .and_then(|content| resolve_generated_content(content, &element));
+
+    if let Some(content) = &before_content {
+        collector.push_text(content, &before_style);
+    }
+
     for child in element.children() {
         if let Some(child_element) = ElementRef::wrap(child) {
             walk(child_element, &style, rules, collector);
         } else if let Some(text) = child.value().as_text() {
             collector.push_text(text, &style);
         }
+    }
+
+    if let Some(content) = &after_content {
+        collector.push_text(content, &after_style);
     }
 
     if is_block {

@@ -234,6 +234,8 @@ pub struct Style {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub overline: bool,
+    pub line_through: bool,
     pub line_height: f32,
     pub margin_top: Length,
     pub margin_right: Length,
@@ -253,6 +255,12 @@ pub struct Style {
     pub letter_spacing: Length,
     pub white_space: WhiteSpace,
     pub page_name: Option<String>,
+    pub content: Option<String>,
+    pub position: Position,
+    pub offset_left: Option<Length>,
+    pub offset_right: Option<Length>,
+    pub offset_top: Option<Length>,
+    pub offset_bottom: Option<Length>,
     pub variables: std::collections::HashMap<String, String>,
 }
 
@@ -265,6 +273,8 @@ impl Default for Style {
             bold: false,
             italic: false,
             underline: false,
+            overline: false,
+            line_through: false,
             line_height: 1.2,
             margin_top: Length::default(),
             margin_right: Length::default(),
@@ -284,6 +294,12 @@ impl Default for Style {
             letter_spacing: Length::default(),
             white_space: WhiteSpace::Normal,
             page_name: None,
+            content: None,
+            position: Position::Static,
+            offset_left: None,
+            offset_right: None,
+            offset_top: None,
+            offset_bottom: None,
             variables: std::collections::HashMap::new(),
         }
     }
@@ -298,6 +314,8 @@ impl Style {
             bold: parent.bold,
             italic: parent.italic,
             underline: parent.underline,
+            overline: parent.overline,
+            line_through: parent.line_through,
             line_height: parent.line_height,
             px_scale: parent.px_scale,
             list_style: parent.list_style,
@@ -364,6 +382,19 @@ pub struct Declaration {
     pub important: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Position {
+    Static,
+    Relative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoElement {
+    None,
+    Before,
+    After,
+}
+
 #[derive(Clone, Debug)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
@@ -371,6 +402,7 @@ pub struct Rule {
     pub specificity: u32,
     pub order: usize,
     pub origin: u32,
+    pub pseudo: PseudoElement,
 }
 
 const UA_CSS: &str = include_str!("../../lib/res/html.css");
@@ -895,29 +927,37 @@ pub fn parse_css(input: &str, order: &mut usize, media: &MediaContext, origin: u
             continue;
         }
 
-        let mut selectors = Vec::new();
         for raw in split_top_level(&prelude, ',') {
-            let text = raw.trim();
+            let (text, pseudo) = split_pseudo_element(raw.trim());
             if let Ok(selector) = Selector::parse(text) {
-                selectors.push(selector);
+                rules.push(Rule {
+                    selectors: vec![selector],
+                    declarations: declarations.clone(),
+                    specificity: specificity(text),
+                    order: *order,
+                    origin,
+                    pseudo,
+                });
+                *order += 1;
             }
         }
-
-        if selectors.is_empty() {
-            continue;
-        }
-
-        rules.push(Rule {
-            selectors,
-            declarations,
-            specificity: specificity(&prelude),
-            order: *order,
-            origin,
-        });
-        *order += 1;
     }
 
     rules
+}
+
+fn split_pseudo_element(selector: &str) -> (&str, PseudoElement) {
+    for (suffix, pseudo) in [
+        ("::before", PseudoElement::Before),
+        (":before", PseudoElement::Before),
+        ("::after", PseudoElement::After),
+        (":after", PseudoElement::After),
+    ] {
+        if let Some(base) = selector.strip_suffix(suffix) {
+            return (base.trim(), pseudo);
+        }
+    }
+    (selector, PseudoElement::None)
 }
 
 fn split_top_level(input: &str, delimiter: char) -> Vec<String> {
@@ -1117,26 +1157,12 @@ pub fn parse_declarations_detailed(input: &str) -> Vec<Declaration> {
         .collect()
 }
 
+type CascadedDeclaration = (bool, u32, u32, usize, Declaration);
+
 pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style {
     let tag = element.value().name();
     let mut style = style_for_tag(tag, parent);
-
-    let mut declarations: Vec<(bool, u32, u32, usize, Declaration)> = Vec::new();
-    for rule in rules.iter().filter(|rule| {
-        rule.selectors
-            .iter()
-            .any(|selector| selector.matches(element))
-    }) {
-        for declaration in &rule.declarations {
-            declarations.push((
-                declaration.important,
-                rule.origin,
-                rule.specificity,
-                rule.order,
-                declaration.clone(),
-            ));
-        }
-    }
+    let mut declarations = collect_matching_declarations(element, rules, PseudoElement::None);
 
     if let Some(inline) = element.attr("style") {
         for declaration in parse_declarations_detailed(inline) {
@@ -1148,6 +1174,51 @@ pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style 
         declarations.push((false, 1u32, 0, 0, attribute));
     }
 
+    apply_cascaded(&mut style, parent, declarations);
+    style
+}
+
+pub fn pseudo_style_for(
+    element: &ElementRef,
+    parent: &Style,
+    rules: &[Rule],
+    pseudo: PseudoElement,
+) -> Style {
+    let mut style = Style::inherited(parent);
+    let declarations = collect_matching_declarations(element, rules, pseudo);
+    apply_cascaded(&mut style, parent, declarations);
+    style
+}
+
+fn collect_matching_declarations(
+    element: &ElementRef,
+    rules: &[Rule],
+    pseudo: PseudoElement,
+) -> Vec<CascadedDeclaration> {
+    let mut declarations = Vec::new();
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.pseudo == pseudo)
+        .filter(|rule| {
+            rule.selectors
+                .iter()
+                .any(|selector| selector.matches(element))
+        })
+    {
+        for declaration in &rule.declarations {
+            declarations.push((
+                declaration.important,
+                rule.origin,
+                rule.specificity,
+                rule.order,
+                declaration.clone(),
+            ));
+        }
+    }
+    declarations
+}
+
+fn apply_cascaded(style: &mut Style, parent: &Style, mut declarations: Vec<CascadedDeclaration>) {
     declarations.sort_by_key(|(important, origin, specificity, order, _)| {
         (*important, *origin, *specificity, *order)
     });
@@ -1174,9 +1245,7 @@ pub fn style_for(element: &ElementRef, parent: &Style, rules: &[Rule]) -> Style 
         })
         .collect::<Vec<_>>();
     style.variables = variables;
-    apply_style_declarations(&mut style, &resolved, parent.font_size);
-
-    style
+    apply_style_declarations(style, &resolved, parent.font_size);
 }
 
 fn resolve_value(
@@ -1375,13 +1444,44 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                     style.page_name = Some(name);
                 }
             }
+            "position" => {
+                style.position = if value.trim().eq_ignore_ascii_case("relative") {
+                    Position::Relative
+                } else {
+                    Position::Static
+                };
+            }
+            "left" => {
+                style.offset_left = parse_length_resolved(value, parent_size, style.px_scale);
+            }
+            "right" => {
+                style.offset_right = parse_length_resolved(value, parent_size, style.px_scale);
+            }
+            "top" => {
+                style.offset_top = parse_length_resolved(value, parent_size, style.px_scale);
+            }
+            "bottom" => {
+                style.offset_bottom = parse_length_resolved(value, parent_size, style.px_scale);
+            }
+            "content" => {
+                if value.trim().eq_ignore_ascii_case("none")
+                    || value.trim().eq_ignore_ascii_case("normal")
+                {
+                    style.content = None;
+                } else {
+                    style.content = Some(value.trim().to_string());
+                }
+            }
             "font-family" => {
                 if let Some(family) = clean_family(value) {
                     style.font_family = family;
                 }
             }
             "text-decoration" | "text-decoration-line" => {
-                style.underline = value.to_ascii_lowercase().contains("underline");
+                let decoration = value.to_ascii_lowercase();
+                style.underline = decoration.contains("underline");
+                style.overline = decoration.contains("overline");
+                style.line_through = decoration.contains("line-through");
             }
             "background-color" => style.background = parse_color(value),
             "background" => {

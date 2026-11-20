@@ -786,3 +786,42 @@ fn positions_background_image_from_right_top() {
 
     assert!(transform_x.is_some());
 }
+
+#[test]
+fn renders_hierarchical_bookmarks_from_headings() {
+    let pdf = html2pdf_rs::render_html(
+        "<h1>Bab Satu</h1><p>Isi</p><h2>Bagian A</h2><p>A</p>\
+         <h1>Bab Dua</h1><p>B</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/Type /Outlines"));
+    assert!(raw.contains("/PageMode /UseOutlines"));
+    assert!(raw.contains("/Count 3"));
+    let object_id = |title: &str| {
+        let marker = format!("/Title ({title})");
+        let lines = raw.lines().collect::<Vec<_>>();
+        let position = lines.iter().position(|line| line.contains(&marker))?;
+        lines[..position]
+            .iter()
+            .rev()
+            .find(|line| line.contains(" obj"))?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    };
+    let first = object_id("Bab Satu").expect("first heading object");
+    let nested = object_id("Bagian A").expect("nested heading object");
+
+    assert!(raw.contains(&format!("/Parent {first} 0 R")));
+    assert!(nested != first);
+}
+
+#[test]
+fn omits_outlines_without_headings() {
+    let pdf = html2pdf_rs::render_html("<p>Tanpa judul</p>");
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(!raw.contains("/Type /Outlines"));
+    assert!(!raw.contains("/PageMode /UseOutlines"));
+}

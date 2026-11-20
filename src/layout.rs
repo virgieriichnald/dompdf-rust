@@ -98,6 +98,14 @@ pub struct Anchor {
 }
 
 #[derive(Clone, Debug)]
+pub struct Bookmark {
+    pub title: String,
+    pub page: usize,
+    pub top: f32,
+    pub level: usize,
+}
+
+#[derive(Clone, Debug)]
 struct BlockStyle {
     background: Option<[f32; 3]>,
     background_alpha: f32,
@@ -204,6 +212,7 @@ pub struct Metadata {
 pub struct Document {
     pub pages: Vec<Page>,
     pub anchors: Vec<Anchor>,
+    pub bookmarks: Vec<Bookmark>,
     pub images: Vec<ImageAsset>,
     pub fonts: Vec<EmbeddedFont>,
     pub metadata: Metadata,
@@ -288,6 +297,7 @@ impl Document {
         Document {
             pages: collector.pages,
             anchors: collector.anchors,
+            bookmarks: collector.bookmarks,
             images: collector.images,
             fonts: collector.fonts,
             metadata,
@@ -388,6 +398,7 @@ struct ListState {
 struct Collector {
     pages: Vec<Page>,
     anchors: Vec<Anchor>,
+    bookmarks: Vec<Bookmark>,
     current: Vec<InlineItem>,
     width: f32,
     height: f32,
@@ -439,6 +450,7 @@ impl Collector {
                 geometry,
             }],
             anchors: Vec::new(),
+            bookmarks: Vec::new(),
             current: Vec::new(),
             width: 0.0,
             height: 0.0,
@@ -1151,6 +1163,32 @@ fn resolve_generated_content(
     (!output.is_empty()).then_some(output)
 }
 
+fn heading_level(tag: &str) -> Option<usize> {
+    match tag {
+        "h1" => Some(1),
+        "h2" => Some(2),
+        "h3" => Some(3),
+        "h4" => Some(4),
+        "h5" => Some(5),
+        "h6" => Some(6),
+        _ => None,
+    }
+}
+
+fn collect_element_text(element: ElementRef, output: &mut String) {
+    for child in element.children() {
+        if let Some(child_element) = ElementRef::wrap(child) {
+            collect_element_text(child_element, output);
+        } else if let Some(text) = child.value().as_text() {
+            output.push_str(text);
+        }
+    }
+}
+
+fn normalize_title(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Collector) {
     let tag = element.value().name();
 
@@ -1236,6 +1274,20 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         layout_overlay(&element, &style, rules, collector, None);
         collector.link = previous_link;
         return;
+    }
+
+    if let Some(level) = heading_level(tag) {
+        let mut text = String::new();
+        collect_element_text(element, &mut text);
+        let title = normalize_title(&text);
+        if !title.is_empty() {
+            collector.bookmarks.push(Bookmark {
+                title,
+                page: collector.pages.len() - 1,
+                top: collector.cursor,
+                level,
+            });
+        }
     }
 
     if tag == "br" {
@@ -1633,6 +1685,8 @@ fn layout_table<'a>(
             let saved_block = collector.block.clone();
             let saved_stack_len = collector.style_stack.len();
             let saved_pages = collector.pages.len();
+            let saved_anchors = collector.anchors.len();
+            let saved_bookmarks = collector.bookmarks.len();
 
             collector.max_width = content_width;
             collector.page_height = f32::MAX;
@@ -1661,6 +1715,8 @@ fn layout_table<'a>(
                 line.border_radius = cell_style.border_radius;
             }
             collector.pages.truncate(saved_pages);
+            collector.anchors.truncate(saved_anchors);
+            collector.bookmarks.truncate(saved_bookmarks);
             collector.style_stack.truncate(saved_stack_len);
             collector.max_width = saved_max;
             collector.page_height = saved_page_height;
@@ -1732,6 +1788,8 @@ fn layout_overlay<'a>(
     let saved_block = collector.block.clone();
     let saved_stack_len = collector.style_stack.len();
     let saved_pages = collector.pages.len();
+    let saved_anchors = collector.anchors.len();
+    let saved_bookmarks = collector.bookmarks.len();
 
     let content_width = (collector.max_width * 0.6).max(1.0);
     collector.max_width = content_width;
@@ -1763,6 +1821,8 @@ fn layout_overlay<'a>(
         line.opacity *= style.opacity;
     }
     collector.pages.truncate(saved_pages);
+    collector.anchors.truncate(saved_anchors);
+    collector.bookmarks.truncate(saved_bookmarks);
     collector.style_stack.truncate(saved_stack_len);
     collector.max_width = saved_max;
     collector.page_height = saved_page_height;

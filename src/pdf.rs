@@ -1,5 +1,5 @@
 use pdf_writer::types::{
-    ActionType, AnnotationType, CidFontType, FontFlags, SystemInfo, UnicodeCmap,
+    ActionType, AnnotationType, CidFontType, FontFlags, PageMode, SystemInfo, UnicodeCmap,
 };
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
@@ -12,6 +12,79 @@ struct FontRefs {
     descriptor: Ref,
     file: Ref,
     to_unicode: Ref,
+}
+
+struct OutlineNode {
+    id: Ref,
+    level: usize,
+    title: String,
+    page: usize,
+    top: f32,
+    parent: Option<usize>,
+    prev: Option<usize>,
+    next: Option<usize>,
+    first: Option<usize>,
+    last: Option<usize>,
+}
+
+fn build_outline_nodes(document: &Document, ids: &[Ref]) -> Vec<OutlineNode> {
+    let mut nodes = document
+        .bookmarks
+        .iter()
+        .zip(ids.iter().copied())
+        .map(|(bookmark, id)| OutlineNode {
+            id,
+            level: bookmark.level,
+            title: bookmark.title.clone(),
+            page: bookmark.page,
+            top: bookmark.top,
+            parent: None,
+            prev: None,
+            next: None,
+            first: None,
+            last: None,
+        })
+        .collect::<Vec<_>>();
+    let max_level = nodes.iter().map(|node| node.level).max().unwrap_or(1);
+    let mut stack: Vec<usize> = Vec::new();
+    let mut last_at_level = vec![None; max_level + 2];
+
+    for index in 0..nodes.len() {
+        let level = nodes[index].level;
+        while stack
+            .last()
+            .is_some_and(|&parent| nodes[parent].level >= level)
+        {
+            stack.pop();
+        }
+        let parent = stack.last().copied();
+        let prev = last_at_level[level];
+        nodes[index].parent = parent;
+        nodes[index].prev = prev;
+        if let Some(prev) = prev {
+            nodes[prev].next = Some(index);
+        }
+        if let Some(parent) = parent {
+            if nodes[parent].first.is_none() {
+                nodes[parent].first = Some(index);
+            }
+            nodes[parent].last = Some(index);
+        }
+        last_at_level[level] = Some(index);
+        stack.push(index);
+    }
+
+    nodes
+}
+
+fn outline_descendant_count(nodes: &[OutlineNode], index: usize) -> usize {
+    let mut count = 0;
+    let mut child = nodes[index].first;
+    while let Some(index) = child {
+        count += 1 + outline_descendant_count(nodes, index);
+        child = nodes[index].next;
+    }
+    count
 }
 
 pub fn write_pdf(document: &Document) -> Vec<u8> {
@@ -63,6 +136,16 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             id
         })
         .collect::<Vec<_>>();
+    let outlines_id = Ref::new(next_id);
+    next_id += 1;
+    let outline_item_ids = (0..document.bookmarks.len())
+        .map(|_| {
+            let id = Ref::new(next_id);
+            next_id += 1;
+            id
+        })
+        .collect::<Vec<_>>();
+    let outline_nodes = build_outline_nodes(document, &outline_item_ids);
     let destinations = document
         .anchors
         .iter()
@@ -85,11 +168,31 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
                 .xyz(0.0, *top, Some(0.0));
         }
     }
+    if !outline_nodes.is_empty() {
+        let top_level = outline_nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| node.parent.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        let mut outline = pdf.outline(outlines_id);
+        outline.count(outline_nodes.len() as i32);
+        if let Some(&first) = top_level.first() {
+            outline.first(outline_nodes[first].id);
+        }
+        if let Some(&last) = top_level.last() {
+            outline.last(outline_nodes[last].id);
+        }
+    }
     {
         let mut catalog = pdf.catalog(catalog_id);
         catalog.pages(pages_id);
         if !destinations.is_empty() {
             catalog.destinations(destinations_id);
+        }
+        if !outline_nodes.is_empty() {
+            catalog
+                .outlines(outlines_id)
+                .page_mode(PageMode::UseOutlines);
         }
     }
 
@@ -109,6 +212,36 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         info.keywords(TextStr(keywords));
     }
     info.finish();
+
+    for (index, node) in outline_nodes.iter().enumerate() {
+        let mut item = pdf.outline_item(node.id);
+        item.title(TextStr(node.title.as_str())).parent(
+            node.parent
+                .map_or(outlines_id, |index| outline_nodes[index].id),
+        );
+        if let Some(prev) = node.prev {
+            item.prev(outline_nodes[prev].id);
+        }
+        if let Some(next) = node.next {
+            item.next(outline_nodes[next].id);
+        }
+        if let Some(first) = node.first {
+            item.first(outline_nodes[first].id);
+        }
+        if let Some(last) = node.last {
+            item.last(outline_nodes[last].id);
+        }
+        let descendants = outline_descendant_count(&outline_nodes, index);
+        if descendants > 0 {
+            item.count(descendants as i32);
+        }
+        item.dest().page(page_ids[node.page]).xyz(
+            0.0,
+            document.pages[node.page].geometry.height - node.top,
+            None,
+        );
+        item.finish();
+    }
 
     for (&id, base) in font_ids.iter().zip([
         b"Helvetica".as_slice(),

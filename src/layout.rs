@@ -5,8 +5,8 @@ use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
 use crate::css::{
-    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Display, FontFace, Length,
-    ListStyle, MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign,
+    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Clear, Display, Float, FontFace,
+    Length, ListStyle, MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign,
     VerticalAlign, WhiteSpace, parse_color, parse_font_faces, parse_length, parse_page_rules,
     parse_styles, pseudo_style_for, px_scale, style_for,
 };
@@ -60,6 +60,7 @@ pub struct Run {
     pub font: FontId,
     pub size: f32,
     pub color: [f32; 3],
+    pub alpha: f32,
     pub underline: bool,
     pub overline: bool,
     pub line_through: bool,
@@ -99,24 +100,30 @@ pub struct Anchor {
 #[derive(Clone, Debug)]
 struct BlockStyle {
     background: Option<[f32; 3]>,
+    background_alpha: f32,
     background_image: Option<usize>,
     background_repeat: BackgroundRepeat,
     background_size: BackgroundSize,
+    background_position_x: f32,
+    background_position_y: f32,
     border: Option<BorderSpec>,
     opacity: f32,
-    border_radius: f32,
+    border_radius: [f32; 4],
 }
 
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
             background: None,
+            background_alpha: 1.0,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_position_x: 0.0,
+            background_position_y: 0.0,
             border: None,
             opacity: 1.0,
-            border_radius: 0.0,
+            border_radius: [0.0; 4],
         }
     }
 }
@@ -132,13 +139,16 @@ pub struct Line {
     pub left: f32,
     pub align: TextAlign,
     pub background: Option<[f32; 3]>,
+    pub background_alpha: f32,
     pub background_image: Option<usize>,
     pub background_repeat: BackgroundRepeat,
     pub background_size: BackgroundSize,
+    pub background_position_x: f32,
+    pub background_position_y: f32,
     pub background_width: Option<f32>,
     pub border: Option<BorderSpec>,
     pub opacity: f32,
-    pub border_radius: f32,
+    pub border_radius: [f32; 4],
     pub links: Vec<LinkRect>,
 }
 
@@ -251,6 +261,7 @@ impl Document {
         let base_style = Style {
             font_family: options.default_font.clone(),
             px_scale: px_scale(options.dpi),
+            containing_width: (options.width - 2.0 * options.margin).max(1.0),
             ..Style::default()
         };
         let geometry = PageGeometry {
@@ -388,6 +399,8 @@ struct Collector {
     offset_x: f32,
     offset_y: f32,
     offset_stack: Vec<(f32, f32)>,
+    float_left_bottom: f32,
+    float_right_bottom: f32,
     align: TextAlign,
     max_width: f32,
     page_height: f32,
@@ -402,7 +415,7 @@ struct Collector {
     link: Option<String>,
     lists: Vec<ListState>,
     counters: HashMap<String, Vec<i32>>,
-    counter_stack: Vec<HashMap<String, Vec<i32>>>,
+    reset_stack: Vec<Vec<String>>,
     px_scale: f32,
     image_byte_limit: Option<usize>,
     policy: ResourcePolicy,
@@ -437,6 +450,8 @@ impl Collector {
             offset_x: 0.0,
             offset_y: 0.0,
             offset_stack: Vec::new(),
+            float_left_bottom: 0.0,
+            float_right_bottom: 0.0,
             align: TextAlign::Left,
             max_width: content_width,
             page_height: content_height,
@@ -451,7 +466,7 @@ impl Collector {
             link: None,
             lists: Vec::new(),
             counters: HashMap::new(),
-            counter_stack: Vec::new(),
+            reset_stack: Vec::new(),
             px_scale,
             image_byte_limit,
             policy,
@@ -482,6 +497,8 @@ impl Collector {
         });
         self.apply_geometry(geometry);
         self.cursor = 0.0;
+        self.float_left_bottom = 0.0;
+        self.float_right_bottom = 0.0;
     }
 
     fn page_is_empty(&self) -> bool {
@@ -491,17 +508,20 @@ impl Collector {
     fn push_line(&mut self, mut line: Line) {
         if line.background.is_none() {
             line.background = self.block.background;
+            line.background_alpha = self.block.background_alpha;
         }
         if line.background_image.is_none() {
             line.background_image = self.block.background_image;
             line.background_repeat = self.block.background_repeat;
             line.background_size = self.block.background_size;
+            line.background_position_x = self.block.background_position_x;
+            line.background_position_y = self.block.background_position_y;
         }
         if line.border.is_none() {
             line.border = self.block.border;
         }
         line.opacity *= self.block.opacity;
-        if line.border_radius == 0.0 {
+        if line.border_radius.iter().all(|radius| *radius == 0.0) {
             line.border_radius = self.block.border_radius;
         }
         if line.background_width.is_none()
@@ -555,13 +575,16 @@ impl Collector {
             left: 0.0,
             align: self.align,
             background: None,
+            background_alpha: 1.0,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_position_x: 0.0,
+            background_position_y: 0.0,
             background_width: None,
             border: None,
             opacity: 1.0,
-            border_radius: 0.0,
+            border_radius: [0.0; 4],
             links: Vec::new(),
         };
 
@@ -574,8 +597,13 @@ impl Collector {
     fn start_block(&mut self, style: &Style) {
         self.flush_line();
         self.style_stack.push(self.block.clone());
-        self.counter_stack.push(self.counters.clone());
-        apply_counter_style(&mut self.counters, style);
+        let mut reset_names = Vec::new();
+        if let Some((name, value)) = &style.counter_reset {
+            self.counters.entry(name.clone()).or_default().push(*value);
+            reset_names.push(name.clone());
+        }
+        increment_counter(&mut self.counters, style);
+        self.reset_stack.push(reset_names);
         self.offset_stack.push((self.offset_x, self.offset_y));
         if style.position == Position::Relative {
             let dx = if let Some(left) = style.offset_left {
@@ -599,17 +627,20 @@ impl Collector {
         }
         if style.background.is_some() {
             self.block.background = style.background;
+            self.block.background_alpha = style.background_alpha;
         }
         if let Some(url) = &style.background_image {
             self.block.background_image = self.load_image_index(url);
         }
         self.block.background_repeat = style.background_repeat;
         self.block.background_size = style.background_size;
+        self.block.background_position_x = style.background_position_x;
+        self.block.background_position_y = style.background_position_y;
         if style.border.is_some() {
             self.block.border = style.border;
         }
         self.block.opacity *= style.opacity;
-        if style.border_radius > 0.0 {
+        if style.border_radius.iter().any(|radius| *radius > 0.0) {
             self.block.border_radius = style.border_radius;
         }
         self.pending_before = self.pending_before.max(style.margin_top_pt());
@@ -627,8 +658,15 @@ impl Collector {
         if let Some(block) = self.style_stack.pop() {
             self.block = block;
         }
-        if let Some(counters) = self.counter_stack.pop() {
-            self.counters = counters;
+        if let Some(names) = self.reset_stack.pop() {
+            for name in names {
+                if let Some(values) = self.counters.get_mut(&name) {
+                    values.pop();
+                    if values.is_empty() {
+                        self.counters.remove(&name);
+                    }
+                }
+            }
         }
         if let Some((x, y)) = self.offset_stack.pop() {
             self.offset_x = x;
@@ -739,6 +777,7 @@ impl Collector {
             font: self.font_id(style),
             size: style.font_size,
             color: style.color,
+            alpha: style.color_alpha,
             underline: style.underline,
             overline: style.overline,
             line_through: style.line_through,
@@ -1012,10 +1051,7 @@ fn dec2roman(value: i64) -> String {
     roman
 }
 
-fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
-    if let Some((name, value)) = &style.counter_reset {
-        counters.insert(name.clone(), vec![*value]);
-    }
+fn increment_counter(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
     if let Some((name, delta)) = &style.counter_increment {
         let values = counters.entry(name.clone()).or_insert_with(|| vec![0]);
         if let Some(last) = values.last_mut() {
@@ -1024,6 +1060,17 @@ fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) 
             values.push(*delta);
         }
     }
+}
+
+fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
+    if let Some((name, value)) = &style.counter_reset {
+        if let Some(values) = counters.get_mut(name) {
+            values.push(*value);
+        } else {
+            counters.insert(name.clone(), vec![*value]);
+        }
+    }
+    increment_counter(counters, style);
 }
 
 fn format_counter(counters: &HashMap<String, Vec<i32>>, name: &str) -> String {
@@ -1134,6 +1181,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         style.border = Some(BorderSpec {
             width,
             color: [0.0, 0.0, 0.0],
+            alpha: 1.0,
             top: true,
             right: true,
             bottom: true,
@@ -1165,8 +1213,27 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             .map(|href| resolve_uri(href, &collector.base));
     }
 
+    if style.clear != Clear::None {
+        collector.flush_line();
+        let bottom = match style.clear {
+            Clear::Left => collector.float_left_bottom,
+            Clear::Right => collector.float_right_bottom,
+            Clear::Both => collector
+                .float_left_bottom
+                .max(collector.float_right_bottom),
+            Clear::None => 0.0,
+        };
+        collector.cursor = collector.cursor.max(bottom);
+    }
+
+    if style.float != Float::None {
+        layout_float(&element, &style, rules, collector);
+        collector.link = previous_link;
+        return;
+    }
+
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        layout_overlay(&element, &style, rules, collector);
+        layout_overlay(&element, &style, rules, collector, None);
         collector.link = previous_link;
         return;
     }
@@ -1253,8 +1320,10 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     let after_style = pseudo_style_for(&element, &style, rules, PseudoElement::After);
     let mut before_counters = collector.counters.clone();
     apply_counter_style(&mut before_counters, &before_style);
-    let mut after_counters = before_counters.clone();
+    increment_counter(&mut collector.counters, &before_style);
+    let mut after_counters = collector.counters.clone();
     apply_counter_style(&mut after_counters, &after_style);
+    increment_counter(&mut collector.counters, &after_style);
     let before_content = before_style
         .content
         .as_deref()
@@ -1378,6 +1447,7 @@ fn emit_prepared_row(
             left: x,
             align: TextAlign::Left,
             background: cell.style.background,
+            background_alpha: cell.style.background_alpha,
             background_image: cell
                 .style
                 .background_image
@@ -1385,6 +1455,8 @@ fn emit_prepared_row(
                 .and_then(|url| collector.load_image_index(url)),
             background_repeat: cell.style.background_repeat,
             background_size: cell.style.background_size,
+            background_position_x: cell.style.background_position_x,
+            background_position_y: cell.style.background_position_y,
             background_width: Some(cell_width),
             border: cell.style.border,
             opacity: cell.style.opacity,
@@ -1636,11 +1708,21 @@ fn layout_table<'a>(
     }
 }
 
+fn layout_float<'a>(
+    element: &ElementRef<'a>,
+    style: &Style,
+    rules: &[Rule],
+    collector: &mut Collector,
+) {
+    layout_overlay(element, style, rules, collector, Some(style.float));
+}
+
 fn layout_overlay<'a>(
     element: &ElementRef<'a>,
     style: &Style,
     rules: &[Rule],
     collector: &mut Collector,
+    float: Option<Float>,
 ) {
     let saved_max = collector.max_width;
     let saved_page_height = collector.page_height;
@@ -1660,6 +1742,7 @@ fn layout_overlay<'a>(
     collector.pending_before = 0.0;
     collector.block = BlockStyle {
         background: style.background,
+        background_alpha: style.background_alpha,
         border: style.border,
         opacity: style.opacity,
         border_radius: style.border_radius,
@@ -1705,19 +1788,31 @@ fn layout_overlay<'a>(
             .map(|length| length.resolve_with(style.font_size, style.px_scale))
             .unwrap_or(0.0)
     };
-    let x = if let Some(left) = style.offset_left {
-        resolve(Some(left))
-    } else if style.offset_right.is_some() {
-        saved_max - box_width - resolve(style.offset_right)
+    let (x, y) = if let Some(side) = float {
+        (
+            if side == Float::Left {
+                0.0
+            } else {
+                saved_max - box_width
+            },
+            saved_cursor,
+        )
     } else {
-        0.0
-    };
-    let y = if let Some(top) = style.offset_top {
-        resolve(Some(top))
-    } else if style.offset_bottom.is_some() {
-        saved_page_height - box_height - resolve(style.offset_bottom)
-    } else {
-        0.0
+        let x = if let Some(left) = style.offset_left {
+            resolve(Some(left))
+        } else if style.offset_right.is_some() {
+            saved_max - box_width - resolve(style.offset_right)
+        } else {
+            0.0
+        };
+        let y = if let Some(top) = style.offset_top {
+            resolve(Some(top))
+        } else if style.offset_bottom.is_some() {
+            saved_page_height - box_height - resolve(style.offset_bottom)
+        } else {
+            0.0
+        };
+        (x, y)
     };
 
     let background_image = style
@@ -1738,9 +1833,12 @@ fn layout_overlay<'a>(
             left: x,
             align: TextAlign::Left,
             background: style.background,
+            background_alpha: style.background_alpha,
             background_image,
             background_repeat: style.background_repeat,
             background_size: style.background_size,
+            background_position_x: style.background_position_x,
+            background_position_y: style.background_position_y,
             background_width: Some(box_width),
             border: style.border,
             opacity: style.opacity,
@@ -1757,6 +1855,15 @@ fn layout_overlay<'a>(
             z: style.z_index,
             line,
         });
+    }
+
+    if let Some(side) = float {
+        let bottom = y + box_height;
+        match side {
+            Float::Left => collector.float_left_bottom = collector.float_left_bottom.max(bottom),
+            Float::Right => collector.float_right_bottom = collector.float_right_bottom.max(bottom),
+            Float::None => {}
+        }
     }
 }
 

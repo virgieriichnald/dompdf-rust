@@ -65,14 +65,29 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BorderSpec {
     pub width: f32,
     pub color: [f32; 3],
+    pub alpha: f32,
     pub top: bool,
     pub right: bool,
     pub bottom: bool,
     pub left: bool,
+}
+
+impl Default for BorderSpec {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            color: [0.0, 0.0, 0.0],
+            alpha: 1.0,
+            top: true,
+            right: true,
+            bottom: true,
+            left: true,
+        }
+    }
 }
 
 impl BorderSpec {
@@ -214,21 +229,15 @@ impl Length {
     }
 
     pub fn resolve_with(self, font_size: f32, scale: f32) -> f32 {
-        match self.unit {
-            Unit::Pt => self.value,
-            Unit::Px => self.value * scale,
-            Unit::Em => self.value * font_size,
-            Unit::In => self.value * 72.0,
-            Unit::Cm => self.value * 72.0 / 2.54,
-            Unit::Mm => self.value * 72.0 / 25.4,
-            Unit::Percent => 0.0,
-        }
+        self.resolve_with_size(font_size, font_size, scale)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Style {
     pub color: [f32; 3],
+    pub color_alpha: f32,
+    pub background_alpha: f32,
     pub font_family: String,
     pub font_size: f32,
     pub bold: bool,
@@ -249,15 +258,18 @@ pub struct Style {
     pub background_image: Option<String>,
     pub background_repeat: BackgroundRepeat,
     pub background_size: BackgroundSize,
+    pub background_position_x: f32,
+    pub background_position_y: f32,
     pub border: Option<BorderSpec>,
     pub opacity: f32,
-    pub border_radius: f32,
+    pub border_radius: [f32; 4],
     pub border_collapse: BorderCollapse,
     pub border_spacing: f32,
     pub vertical_align: VerticalAlign,
     pub text_align: TextAlign,
     pub display: Display,
     pub px_scale: f32,
+    pub containing_width: f32,
     pub list_style: ListStyle,
     pub text_indent: Length,
     pub letter_spacing: Length,
@@ -267,6 +279,8 @@ pub struct Style {
     pub counter_reset: Option<(String, i32)>,
     pub counter_increment: Option<(String, i32)>,
     pub position: Position,
+    pub float: Float,
+    pub clear: Clear,
     pub z_index: i32,
     pub offset_left: Option<Length>,
     pub offset_right: Option<Length>,
@@ -279,6 +293,8 @@ impl Default for Style {
     fn default() -> Self {
         Self {
             color: [0.0, 0.0, 0.0],
+            color_alpha: 1.0,
+            background_alpha: 1.0,
             font_family: "Helvetica".to_string(),
             font_size: 12.0,
             bold: false,
@@ -299,15 +315,18 @@ impl Default for Style {
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_position_x: 0.0,
+            background_position_y: 0.0,
             border: None,
             opacity: 1.0,
-            border_radius: 0.0,
+            border_radius: [0.0; 4],
             border_collapse: BorderCollapse::Separate,
             border_spacing: 0.0,
             vertical_align: VerticalAlign::Baseline,
             text_align: TextAlign::Left,
             display: Display::Inline,
             px_scale: px_scale(DEFAULT_DPI),
+            containing_width: 0.0,
             list_style: ListStyle::Disc,
             text_indent: Length::default(),
             letter_spacing: Length::default(),
@@ -317,6 +336,8 @@ impl Default for Style {
             counter_reset: None,
             counter_increment: None,
             position: Position::Static,
+            float: Float::None,
+            clear: Clear::None,
             z_index: 0,
             offset_left: None,
             offset_right: None,
@@ -331,6 +352,7 @@ impl Style {
     pub fn inherited(parent: &Style) -> Self {
         Self {
             color: parent.color,
+            color_alpha: parent.color_alpha,
             font_family: parent.font_family.clone(),
             font_size: parent.font_size,
             bold: parent.bold,
@@ -340,6 +362,7 @@ impl Style {
             line_through: parent.line_through,
             line_height: parent.line_height,
             px_scale: parent.px_scale,
+            containing_width: parent.containing_width,
             list_style: parent.list_style,
             text_indent: parent.text_indent,
             letter_spacing: parent.letter_spacing,
@@ -351,49 +374,53 @@ impl Style {
     }
 
     pub fn margin_top_pt(&self) -> f32 {
-        self.margin_top.resolve_with(self.font_size, self.px_scale)
+        self.margin_top
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn margin_right_pt(&self) -> f32 {
         self.margin_right
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn margin_bottom_pt(&self) -> f32 {
         self.margin_bottom
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn margin_left_pt(&self) -> f32 {
-        self.margin_left.resolve_with(self.font_size, self.px_scale)
+        self.margin_left
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn padding_top_pt(&self) -> f32 {
-        self.padding_top.resolve_with(self.font_size, self.px_scale)
+        self.padding_top
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn padding_right_pt(&self) -> f32 {
         self.padding_right
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn padding_bottom_pt(&self) -> f32 {
         self.padding_bottom
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn padding_left_pt(&self) -> f32 {
         self.padding_left
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn text_indent_pt(&self) -> f32 {
-        self.text_indent.resolve_with(self.font_size, self.px_scale)
+        self.text_indent
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
     pub fn letter_spacing_pt(&self) -> f32 {
         self.letter_spacing
-            .resolve_with(self.font_size, self.px_scale)
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 }
 
@@ -413,16 +440,32 @@ pub enum Position {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundRepeat {
     Repeat,
     NoRepeat,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackgroundSize {
     Auto,
     Cover,
     Contain,
+    Dimensions(f32, f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1336,7 +1379,7 @@ fn apply_cascaded(style: &mut Style, parent: &Style, mut declarations: Vec<Casca
         })
         .collect::<Vec<_>>();
     style.variables = variables;
-    apply_style_declarations(style, &resolved, parent.font_size);
+    apply_style_declarations(style, &resolved, parent.font_size, parent.containing_width);
 }
 
 fn resolve_value(
@@ -1471,10 +1514,15 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
             important: false,
         })
         .collect::<Vec<_>>();
-    apply_style_declarations(style, &detailed, parent_size);
+    apply_style_declarations(style, &detailed, parent_size, parent_size);
 }
 
-fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], parent_size: f32) {
+fn apply_style_declarations(
+    style: &mut Style,
+    declarations: &[Declaration],
+    parent_size: f32,
+    containing_width: f32,
+) {
     let mut line_height_value = None;
 
     for declaration in declarations {
@@ -1483,6 +1531,7 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
             "color" => {
                 if let Some(color) = parse_color(value) {
                     style.color = color;
+                    style.color_alpha = parse_color_alpha(value).unwrap_or(1.0);
                 }
             }
             "font-size" => {
@@ -1500,9 +1549,12 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
             }
             "line-height" => line_height_value = Some(value.to_string()),
             "margin" => {
-                if let Some([top, right, bottom, left]) =
-                    parse_box_shorthand_resolved(value, parent_size, style.px_scale)
-                {
+                if let Some([top, right, bottom, left]) = parse_box_shorthand_resolved(
+                    value,
+                    parent_size,
+                    containing_width,
+                    style.px_scale,
+                ) {
                     style.margin_top = top;
                     style.margin_right = right;
                     style.margin_bottom = bottom;
@@ -1510,22 +1562,30 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "margin-top" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.margin_top = length;
                 }
             }
             "margin-right" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.margin_right = length;
                 }
             }
             "margin-bottom" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.margin_bottom = length;
                 }
             }
             "margin-left" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.margin_left = length;
                 }
             }
@@ -1543,22 +1603,41 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                     _ => Position::Static,
                 };
             }
+            "float" => {
+                style.float = match value.trim().to_ascii_lowercase().as_str() {
+                    "left" => Float::Left,
+                    "right" => Float::Right,
+                    _ => Float::None,
+                };
+            }
+            "clear" => {
+                style.clear = match value.trim().to_ascii_lowercase().as_str() {
+                    "left" => Clear::Left,
+                    "right" => Clear::Right,
+                    "left right" | "right left" | "both" => Clear::Both,
+                    _ => Clear::None,
+                };
+            }
             "z-index" => {
                 if let Ok(value) = value.trim().parse::<i32>() {
                     style.z_index = value;
                 }
             }
             "left" => {
-                style.offset_left = parse_length_resolved(value, parent_size, style.px_scale);
+                style.offset_left =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
             }
             "right" => {
-                style.offset_right = parse_length_resolved(value, parent_size, style.px_scale);
+                style.offset_right =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
             }
             "top" => {
-                style.offset_top = parse_length_resolved(value, parent_size, style.px_scale);
+                style.offset_top =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
             }
             "bottom" => {
-                style.offset_bottom = parse_length_resolved(value, parent_size, style.px_scale);
+                style.offset_bottom =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
             }
             "content" => {
                 if value.trim().eq_ignore_ascii_case("none")
@@ -1582,7 +1661,10 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 style.overline = decoration.contains("overline");
                 style.line_through = decoration.contains("line-through");
             }
-            "background-color" => style.background = parse_color(value),
+            "background-color" => {
+                style.background = parse_color(value);
+                style.background_alpha = parse_color_alpha(value).unwrap_or(1.0);
+            }
             "background-image" => {
                 style.background_image = if value.trim().eq_ignore_ascii_case("none") {
                     None
@@ -1598,13 +1680,38 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 };
             }
             "background-size" => {
-                style.background_size = if value.contains("cover") {
-                    BackgroundSize::Cover
-                } else if value.contains("contain") {
-                    BackgroundSize::Contain
-                } else {
-                    BackgroundSize::Auto
+                if let Some(size) =
+                    parse_background_size(value, style.font_size, containing_width, style.px_scale)
+                {
+                    style.background_size = size;
+                }
+            }
+            "background-position" => {
+                let tokens: Vec<_> = value.split_whitespace().collect();
+                let resolve = |token: &str| match token.to_ascii_lowercase().as_str() {
+                    "left" | "top" => Some(0.0),
+                    "center" => Some(0.5),
+                    "right" | "bottom" => Some(1.0),
+                    _ => parse_length_resolved(
+                        token,
+                        style.font_size,
+                        containing_width,
+                        style.px_scale,
+                    )
+                    .map(|length| {
+                        length.resolve_with_size(style.font_size, containing_width, style.px_scale)
+                            / containing_width.max(1.0)
+                    }),
                 };
+                if let Some(x) = tokens.first().and_then(|token| resolve(token)) {
+                    style.background_position_x = x;
+                    if tokens.len() == 1 {
+                        style.background_position_y = x;
+                    }
+                }
+                if let Some(y) = tokens.get(1).and_then(|token| resolve(token)) {
+                    style.background_position_y = y;
+                }
             }
             "opacity" => {
                 if let Ok(alpha) = value.trim().parse::<f32>() {
@@ -1612,8 +1719,10 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "border-radius" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
-                    style.border_radius = length.resolve_with(style.font_size, style.px_scale);
+                if let Some(radii) =
+                    parse_border_radius(value, style.font_size, containing_width, style.px_scale)
+                {
+                    style.border_radius = radii;
                 }
             }
             "border-collapse" => {
@@ -1624,7 +1733,9 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 };
             }
             "border-spacing" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.border_spacing = length.resolve_with(style.font_size, style.px_scale);
                 }
             }
@@ -1647,6 +1758,9 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 } else {
                     style.background = parse_color(value);
                 }
+                if style.background.is_some() {
+                    style.background_alpha = parse_color_alpha(value).unwrap_or(1.0);
+                }
                 style.background_image = extract_url(value);
                 if value.to_ascii_lowercase().contains("no-repeat") {
                     style.background_repeat = BackgroundRepeat::NoRepeat;
@@ -1658,9 +1772,12 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "padding" => {
-                if let Some([top, right, bottom, left]) =
-                    parse_box_shorthand_resolved(value, parent_size, style.px_scale)
-                {
+                if let Some([top, right, bottom, left]) = parse_box_shorthand_resolved(
+                    value,
+                    parent_size,
+                    containing_width,
+                    style.px_scale,
+                ) {
                     style.padding_top = top;
                     style.padding_right = right;
                     style.padding_bottom = bottom;
@@ -1668,23 +1785,46 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "padding-top" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.padding_top = length;
                 }
             }
             "padding-right" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.padding_right = length;
                 }
             }
             "padding-bottom" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.padding_bottom = length;
                 }
             }
             "padding-left" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.padding_left = length;
+                }
+            }
+            "border-color" => {
+                if let Some(color) = parse_color(value) {
+                    let alpha = parse_color_alpha(value).unwrap_or(1.0);
+                    if let Some(border) = style.border.as_mut() {
+                        border.color = color;
+                        border.alpha = alpha;
+                    } else {
+                        style.border = Some(BorderSpec {
+                            color,
+                            alpha,
+                            ..BorderSpec::default()
+                        });
+                    }
                 }
             }
             "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
@@ -1710,9 +1850,13 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                             }
                         }
                     }
-                } else if let Some(spec) =
-                    parse_border(value, sides, style.font_size, style.px_scale)
-                {
+                } else if let Some(spec) = parse_border(
+                    value,
+                    sides,
+                    style.font_size,
+                    containing_width,
+                    style.px_scale,
+                ) {
                     style.border = Some(spec);
                 }
             }
@@ -1736,7 +1880,9 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 };
             }
             "text-indent" => {
-                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
                     style.text_indent = length;
                 }
             }
@@ -1744,7 +1890,7 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 if matches!(value.trim().to_ascii_lowercase().as_str(), "normal") {
                     style.letter_spacing = Length::default();
                 } else if let Some(length) =
-                    parse_length_resolved(value, parent_size, style.px_scale)
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
                 {
                     style.letter_spacing = length;
                 }
@@ -1776,14 +1922,18 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
 
 impl Length {
     fn resolve_font(self, parent_size: f32, scale: f32) -> f32 {
+        self.resolve_with_size(parent_size, parent_size, scale)
+    }
+
+    pub fn resolve_with_size(self, font_size: f32, containing_width: f32, scale: f32) -> f32 {
         match self.unit {
             Unit::Pt => self.value,
             Unit::Px => self.value * scale,
-            Unit::Em => self.value * parent_size,
+            Unit::Em => self.value * font_size,
             Unit::In => self.value * 72.0,
             Unit::Cm => self.value * 72.0 / 2.54,
             Unit::Mm => self.value * 72.0 / 25.4,
-            Unit::Percent => parent_size * self.value / 100.0,
+            Unit::Percent => containing_width * self.value / 100.0,
         }
     }
 }
@@ -1806,7 +1956,7 @@ fn parse_box_shorthand(input: &str) -> Option<[Length; 4]> {
 fn parse_font_size(input: &str, parent_size: f32, scale: f32) -> Option<f32> {
     let text = input.trim().to_ascii_lowercase();
     if text.starts_with("calc(") && text.ends_with(')') {
-        return eval_length_expression(&text[5..text.len() - 1], parent_size, scale)
+        return eval_length_expression(&text[5..text.len() - 1], parent_size, parent_size, scale)
             .map(|value| value.max(0.0));
     }
     let scale = match text.as_str() {
@@ -1833,8 +1983,8 @@ fn parse_font_size(input: &str, parent_size: f32, scale: f32) -> Option<f32> {
 fn parse_line_height(input: &str, font_size: f32, scale: f32) -> Option<f32> {
     let text = input.trim().to_ascii_lowercase();
     if text.starts_with("calc(") && text.ends_with(')') {
-        let height =
-            eval_length_expression(&text[5..text.len() - 1], font_size, scale)? / font_size;
+        let height = eval_length_expression(&text[5..text.len() - 1], font_size, font_size, scale)?
+            / font_size;
         return (height.is_finite() && height > 0.0).then_some(height);
     }
     if text == "normal" {
@@ -1933,23 +2083,92 @@ pub fn parse_length(input: &str) -> Option<Length> {
         .map(|value| Length { value, unit })
 }
 
-fn parse_length_resolved(input: &str, font_size: f32, scale: f32) -> Option<Length> {
+fn parse_length_resolved(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<Length> {
     let text = input.trim();
     let lower = text.to_ascii_lowercase();
     if lower.starts_with("calc(") && lower.ends_with(')') {
         let expression = text.get(5..text.len() - 1)?;
-        return eval_length_expression(expression, font_size, scale).map(|value| Length {
-            value,
-            unit: Unit::Pt,
-        });
+        return eval_length_expression(expression, font_size, containing_width, scale).map(
+            |value| Length {
+                value,
+                unit: Unit::Pt,
+            },
+        );
     }
     parse_length(text)
 }
 
-fn parse_box_shorthand_resolved(input: &str, font_size: f32, scale: f32) -> Option<[Length; 4]> {
+fn parse_box_shorthand_resolved(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<[Length; 4]> {
     let values = tokenize_lengths(input)
         .iter()
-        .map(|token| parse_length_resolved(token, font_size, scale))
+        .map(|token| parse_length_resolved(token, font_size, containing_width, scale))
+        .collect::<Option<Vec<_>>>()?;
+
+    match values.len() {
+        1 => Some([values[0]; 4]),
+        2 => Some([values[0], values[1], values[0], values[1]]),
+        3 => Some([values[0], values[1], values[2], values[1]]),
+        4 => Some([values[0], values[1], values[2], values[3]]),
+        _ => None,
+    }
+}
+
+fn parse_background_size(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<BackgroundSize> {
+    let lower = input.trim().to_ascii_lowercase();
+    if lower == "cover" {
+        return Some(BackgroundSize::Cover);
+    }
+    if lower == "contain" {
+        return Some(BackgroundSize::Contain);
+    }
+
+    let values = tokenize_lengths(input)
+        .iter()
+        .map(|token| {
+            parse_length_resolved(token, font_size, containing_width, scale).map(|length| {
+                length
+                    .resolve_with_size(font_size, containing_width, scale)
+                    .max(0.0)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match values.len() {
+        1 => Some(BackgroundSize::Dimensions(values[0], values[0])),
+        2 => Some(BackgroundSize::Dimensions(values[0], values[1])),
+        _ => None,
+    }
+}
+
+fn parse_border_radius(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<[f32; 4]> {
+    let values = tokenize_lengths(input)
+        .iter()
+        .map(|token| {
+            parse_length_resolved(token, font_size, containing_width, scale).map(|length| {
+                length
+                    .resolve_with_size(font_size, containing_width, scale)
+                    .max(0.0)
+            })
+        })
         .collect::<Option<Vec<_>>>()?;
 
     match values.len() {
@@ -1991,10 +2210,16 @@ fn tokenize_lengths(input: &str) -> Vec<String> {
     tokens
 }
 
-fn eval_length_expression(input: &str, font_size: f32, scale: f32) -> Option<f32> {
+fn eval_length_expression(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<f32> {
     let mut parser = CalcParser {
         input: input.chars().peekable(),
         font_size,
+        containing_width,
         scale,
     };
     let value = parser.expression()?;
@@ -2008,6 +2233,7 @@ fn eval_length_expression(input: &str, font_size: f32, scale: f32) -> Option<f32
 struct CalcParser<'a> {
     input: std::iter::Peekable<std::str::Chars<'a>>,
     font_size: f32,
+    containing_width: f32,
     scale: f32,
 }
 
@@ -2103,11 +2329,23 @@ impl CalcParser<'_> {
             unit.push(self.input.next()?);
         }
 
-        Some(unit_to_points(value, &unit, self.font_size, self.scale))
+        Some(unit_to_points(
+            value,
+            &unit,
+            self.font_size,
+            self.containing_width,
+            self.scale,
+        ))
     }
 }
 
-fn unit_to_points(value: f32, unit: &str, font_size: f32, scale: f32) -> f32 {
+fn unit_to_points(
+    value: f32,
+    unit: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> f32 {
     match unit.to_ascii_lowercase().as_str() {
         "px" => value * scale,
         "pt" => value,
@@ -2116,32 +2354,43 @@ fn unit_to_points(value: f32, unit: &str, font_size: f32, scale: f32) -> f32 {
         "mm" => value * 72.0 / 25.4,
         "pc" => value * 12.0,
         "em" | "rem" => value * font_size,
-        "%" => value * font_size / 100.0,
+        "%" => value * containing_width / 100.0,
         _ => value,
     }
 }
 
-fn parse_border(input: &str, sides: [bool; 4], font_size: f32, scale: f32) -> Option<BorderSpec> {
+fn parse_border(
+    input: &str,
+    sides: [bool; 4],
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<BorderSpec> {
     let mut width = None;
-    let mut color = None;
+    let mut color = parse_color(input.trim());
+    let mut alpha = parse_color_alpha(input.trim()).unwrap_or(1.0);
 
-    for token in input.split_whitespace() {
-        if width.is_none()
-            && let Some(length) = parse_length(token)
-        {
-            width = Some(length.resolve_with(font_size, scale));
-            continue;
-        }
-        if color.is_none()
-            && let Some(parsed) = parse_color(token)
-        {
-            color = Some(parsed);
+    if color.is_none() {
+        for token in input.split_whitespace() {
+            if width.is_none()
+                && let Some(length) = parse_length(token)
+            {
+                width = Some(length.resolve_with_size(font_size, containing_width, scale));
+                continue;
+            }
+            if color.is_none()
+                && let Some(parsed) = parse_color(token)
+            {
+                color = Some(parsed);
+                alpha = parse_color_alpha(token).unwrap_or(1.0);
+            }
         }
     }
 
     Some(BorderSpec {
         width: width.unwrap_or(1.0),
         color: color.unwrap_or([0.0, 0.0, 0.0]),
+        alpha,
         top: sides[0],
         right: sides[1],
         bottom: sides[2],
@@ -2156,6 +2405,44 @@ fn parse_align(input: &str) -> Option<TextAlign> {
         "right" => Some(TextAlign::Right),
         "justify" => Some(TextAlign::Justify),
         _ => None,
+    }
+}
+
+pub fn parse_color_alpha(input: &str) -> Option<f32> {
+    let text = input.trim().to_ascii_lowercase();
+
+    if let Some(hex) = text.strip_prefix('#') {
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        return match hex.len() {
+            4 | 8 => u32::from_str_radix(&hex[hex.len() - 2..], 16)
+                .ok()
+                .map(|value| value as f32 / 255.0),
+            _ => Some(1.0),
+        };
+    }
+
+    if !text.contains('(') {
+        return named_color(&text).map(|_| 1.0);
+    }
+
+    let (_, alpha) = split_color_channels(text.split_once('(')?.1.strip_suffix(')')?)?;
+    let Some(alpha) = alpha else {
+        return Some(1.0);
+    };
+    if let Some(percent) = alpha.trim().strip_suffix('%') {
+        percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| (value / 100.0).clamp(0.0, 1.0))
+    } else {
+        alpha
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value.clamp(0.0, 1.0))
     }
 }
 

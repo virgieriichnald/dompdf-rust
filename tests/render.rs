@@ -688,3 +688,101 @@ fn repeats_table_header_across_pages() {
 
     assert!(raw.matches("(Header)").count() >= 2);
 }
+
+#[test]
+fn applies_rgba_alpha_to_text_background_and_border() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>p { color: rgba(255,0,0,0.5); background-color: rgba(0,0,255,0.25); \
+         border: 1pt solid rgba(0,128,0,0.75) }</style><p>Alfa</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/ca 0.5"));
+    assert!(raw.contains("/ca 0.25"));
+    assert!(raw.contains("/ca 0.75"));
+}
+
+#[test]
+fn positions_float_and_respects_clear() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>.f { float: left; border: 1pt solid black } \
+         .c { clear: both }</style><div class=\"f\">F</div><p class=\"c\">Setelah</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(matrices.len() >= 2);
+    assert!(matrices[1].1 > matrices[0].1);
+}
+
+#[test]
+fn renders_nested_counters() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>section { counter-reset: bab }\
+         section::before { counter-increment: bab; content: counters(bab, '.') ' ' }</style>\
+         <section>Luar<section>Dalam</section></section>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(1)"));
+    assert!(raw.contains("(1.1)"));
+}
+
+#[test]
+fn resolves_calc_percent_against_containing_width() {
+    let plain = html2pdf_rs::render_html("<p style=\"margin-top:1pt\">Atas</p>");
+    let calculated = html2pdf_rs::render_html("<p style=\"margin-top:calc(10% + 1pt)\">Atas</p>");
+    let plain_y = text_matrices(&String::from_utf8_lossy(&plain))[0].1;
+    let calculated_y = text_matrices(&String::from_utf8_lossy(&calculated))[0].1;
+    let shift = plain_y - calculated_y;
+
+    assert!(shift > 40.0 && shift < 60.0);
+}
+
+#[test]
+fn renders_individual_border_radius_corners() {
+    let uniform = html2pdf_rs::render_html(
+        "<p style=\"border:1pt solid black;border-radius:2pt\">RRRRRRRRRRRRRRRRRRRRRRRRRRRR</p>",
+    );
+    let corners = html2pdf_rs::render_html(
+        "<p style=\"border:1pt solid black;border-radius:2pt 4pt 6pt 8pt\">RRRRRRRRRRRRRRRRRRRRRRRRRRRR</p>",
+    );
+    let raw = String::from_utf8_lossy(&corners);
+
+    assert_ne!(uniform, corners);
+    assert!(raw.contains(" c"));
+}
+
+#[test]
+fn positions_background_image_from_right_top() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+         background-repeat: no-repeat; background-size: 20pt 20pt; \
+         background-position: right top }}</style><div>Latar</div>"
+    ));
+    let raw = String::from_utf8_lossy(&pdf);
+    let transform_x = raw
+        .lines()
+        .filter(|line| line.trim_end().ends_with(" cm"))
+        .filter_map(|line| {
+            let values = line
+                .trim()
+                .trim_end_matches(" cm")
+                .split_whitespace()
+                .filter_map(|value| value.parse::<f32>().ok())
+                .collect::<Vec<_>>();
+            (values.len() == 6 && (values[0] - 20.0).abs() < 0.01).then_some(values[4])
+        })
+        .find(|x| *x > 500.0);
+
+    assert!(transform_x.is_some());
+}

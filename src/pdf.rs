@@ -4,7 +4,7 @@ use pdf_writer::types::{
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
 use crate::css::{BackgroundRepeat, BackgroundSize, TextAlign};
-use crate::layout::{Document, FontId, InlineItem, Page};
+use crate::layout::{Document, FontId, FontKind, InlineItem, Page, measure};
 
 struct FontRefs {
     type0: Ref,
@@ -341,56 +341,103 @@ fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
 
 fn collect_opacities(document: &Document) -> Vec<f32> {
     let mut values: Vec<f32> = Vec::new();
+    let mut push = |alpha: f32| {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha < 0.999 && !values.iter().any(|value| (*value - alpha).abs() < 0.001) {
+            values.push(alpha);
+        }
+    };
     for page in &document.pages {
-        for line in &page.lines {
-            let alpha = line.opacity.clamp(0.0, 1.0);
-            if alpha < 0.999 && !values.iter().any(|value| (*value - alpha).abs() < 0.001) {
-                values.push(alpha);
+        let lines = page
+            .lines
+            .iter()
+            .chain(page.overlays.iter().map(|overlay| &overlay.line));
+        for line in lines {
+            push(line.opacity);
+            push(line.background_alpha);
+            if let Some(border) = line.border {
+                push(border.alpha);
+            }
+            for item in &line.items {
+                if let InlineItem::Text(run) = item {
+                    push(run.alpha);
+                }
             }
         }
     }
     values
 }
 
-fn rounded_rect_path(content: &mut Content, x: f32, y: f32, width: f32, height: f32, radius: f32) {
-    let radius = radius.min(width * 0.5).min(height * 0.5).max(0.0);
-    if radius == 0.0 {
+fn rounded_rect_path(
+    content: &mut Content,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radii: [f32; 4],
+) {
+    let limit = width.min(height) * 0.5;
+    let [mut tl, mut tr, mut br, mut bl] = radii.map(|radius| radius.max(0.0).min(limit));
+    if tl + tr > width {
+        let scale = width / (tl + tr);
+        tl *= scale;
+        tr *= scale;
+    }
+    if bl + br > width {
+        let scale = width / (bl + br);
+        bl *= scale;
+        br *= scale;
+    }
+    if tl + bl > height {
+        let scale = height / (tl + bl);
+        tl *= scale;
+        bl *= scale;
+    }
+    if tr + br > height {
+        let scale = height / (tr + br);
+        tr *= scale;
+        br *= scale;
+    }
+    if [tl, tr, br, bl].iter().all(|radius| *radius == 0.0) {
         content.rect(x, y, width, height);
         return;
     }
 
-    let k = radius * 0.552_284_8;
+    let ktl = tl * 0.552_284_8;
+    let ktr = tr * 0.552_284_8;
+    let kbr = br * 0.552_284_8;
+    let kbl = bl * 0.552_284_8;
     content
-        .move_to(x + radius, y)
-        .line_to(x + width - radius, y)
+        .move_to(x + tl, y)
+        .line_to(x + width - tr, y)
         .cubic_to(
-            x + width - radius + k,
+            x + width - tr + ktr,
             y,
             x + width,
-            y + radius - k,
+            y + tr - ktr,
             x + width,
-            y + radius,
+            y + tr,
         )
-        .line_to(x + width, y + height - radius)
+        .line_to(x + width, y + height - br)
         .cubic_to(
             x + width,
-            y + height - radius + k,
-            x + width - radius + k,
+            y + height - br + kbr,
+            x + width - br + kbr,
             y + height,
-            x + width - radius,
+            x + width - br,
             y + height,
         )
-        .line_to(x + radius, y + height)
+        .line_to(x + bl, y + height)
         .cubic_to(
-            x + radius - k,
+            x + bl - kbl,
             y + height,
             x,
-            y + height - radius + k,
+            y + height - bl + kbl,
             x,
-            y + height - radius,
+            y + height - bl,
         )
-        .line_to(x, y + radius)
-        .cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y)
+        .line_to(x, y + tl)
+        .cubic_to(x, y + tl - ktl, x + tl - ktl, y, x + tl, y)
         .close_path();
 }
 
@@ -418,14 +465,18 @@ fn build_content(
         .collect::<Vec<_>>();
     drawable.sort_by_key(|(z, _)| *z);
 
-    for (_, line) in drawable {
-        let alpha_state = if line.opacity < 0.999 {
+    let state_for = |alpha: f32| {
+        if alpha >= 0.999 {
+            None
+        } else {
             opacities
                 .iter()
-                .position(|value| (value - line.opacity).abs() < 0.001)
-        } else {
-            None
-        };
+                .position(|value| (value - alpha).abs() < 0.001)
+        }
+    };
+
+    for (_, line) in drawable {
+        let alpha_state = state_for(line.opacity);
         if let Some(state) = alpha_state {
             content.save_state();
             let name = format!("GS{}", state + 1);
@@ -459,8 +510,15 @@ fn build_content(
                     let scale = scale.min(contain);
                     (natural_width * scale, natural_height * scale)
                 }
+                BackgroundSize::Dimensions(width, height) => (width, height),
             };
             if tile_width > 0.0 && tile_height > 0.0 {
+                let image_alpha = state_for(line.background_alpha);
+                if let Some(state) = image_alpha {
+                    content.save_state();
+                    let name = format!("GS{}", state + 1);
+                    content.op("gs").operand(Name(name.as_bytes()));
+                }
                 content.save_state();
                 rounded_rect_path(
                     &mut content,
@@ -472,35 +530,53 @@ fn build_content(
                 );
                 content.clip_nonzero();
                 let name = format!("Im{}", index + 1);
-                let mut y = line_y;
-                while y < line_y + line.height {
-                    let mut x_tile = margin + line.left;
-                    while x_tile < margin + line.left + line_width {
+                let repeats = line.background_repeat != BackgroundRepeat::NoRepeat;
+                let left_edge = margin + line.left;
+                let right_edge = left_edge + line_width;
+                let pos_x =
+                    line.background_position_x.clamp(0.0, 1.0) * (line_width - tile_width).max(0.0);
+                let pos_y = line.background_position_y.clamp(0.0, 1.0)
+                    * (line.height - tile_height).max(0.0);
+                let start_top = line_y + line.height - pos_y;
+                let mut bottom = if repeats {
+                    start_top
+                } else {
+                    start_top - tile_height
+                };
+                while bottom + tile_height > line_y {
+                    let mut x_tile = if repeats {
+                        left_edge + pos_x - tile_width
+                    } else {
+                        left_edge + pos_x
+                    };
+                    while x_tile < right_edge {
                         content
-                            .transform([
-                                tile_width,
-                                0.0,
-                                0.0,
-                                tile_height,
-                                x_tile,
-                                y + line.height - tile_height,
-                            ])
+                            .transform([tile_width, 0.0, 0.0, tile_height, x_tile, bottom])
                             .x_object(Name(name.as_bytes()));
-                        if line.background_repeat == BackgroundRepeat::NoRepeat {
+                        if !repeats {
                             break;
                         }
                         x_tile += tile_width;
                     }
-                    if line.background_repeat == BackgroundRepeat::NoRepeat {
+                    if !repeats {
                         break;
                     }
-                    y += tile_height;
+                    bottom -= tile_height;
                 }
                 content.restore_state();
+                if image_alpha.is_some() {
+                    content.restore_state();
+                }
             }
         }
 
         if let Some(color) = line.background {
+            let background_alpha = state_for(line.background_alpha);
+            if let Some(state) = background_alpha {
+                content.save_state();
+                let name = format!("GS{}", state + 1);
+                content.op("gs").operand(Name(name.as_bytes()));
+            }
             content.set_fill_rgb(color[0], color[1], color[2]);
             rounded_rect_path(
                 &mut content,
@@ -511,16 +587,25 @@ fn build_content(
                 line.border_radius,
             );
             content.fill_nonzero();
+            if background_alpha.is_some() {
+                content.restore_state();
+            }
         }
 
         if let Some(border) = line.border {
             let color = border.color;
             let width = border.width;
+            let border_alpha = state_for(border.alpha);
+            if let Some(state) = border_alpha {
+                content.save_state();
+                let name = format!("GS{}", state + 1);
+                content.op("gs").operand(Name(name.as_bytes()));
+            }
             content
                 .set_fill_rgb(color[0], color[1], color[2])
                 .set_line_width(width);
 
-            let rounded = line.border_radius > 0.0
+            let rounded = line.border_radius.iter().any(|radius| *radius > 0.0)
                 && border.top
                 && border.bottom
                 && border.left
@@ -561,6 +646,9 @@ fn build_content(
                 );
             }
             content.fill_nonzero();
+            if border_alpha.is_some() {
+                content.restore_state();
+            }
         }
 
         let max_size = line
@@ -614,6 +702,12 @@ fn build_content(
                         } else {
                             0.0
                         };
+                    let run_alpha = state_for(run.alpha);
+                    if let Some(state) = run_alpha {
+                        content.save_state();
+                        let name = format!("GS{}", state + 1);
+                        content.op("gs").operand(Name(name.as_bytes()));
+                    }
 
                     content
                         .begin_text()
@@ -644,6 +738,9 @@ fn build_content(
                         }
                     }
 
+                    if run_alpha.is_some() {
+                        content.restore_state();
+                    }
                     cursor += width;
                 }
                 InlineItem::Image(image) => {
@@ -673,7 +770,12 @@ fn build_content(
             .replace("{PAGE_COUNT}", &page_count.to_string());
         let bytes = to_win_ansi(&text);
         if !bytes.is_empty() {
-            let text_width = bytes.len() as f32 * 4.5;
+            let text_width = measure(
+                &text,
+                9.0,
+                FontId::Builtin(FontKind::Regular),
+                &document.fonts,
+            );
             let (x, y) = match document.page_text_location {
                 crate::PageTextLocation::TopLeft => (margin, height - margin * 0.5),
                 crate::PageTextLocation::TopCenter => {

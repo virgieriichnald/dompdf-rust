@@ -586,3 +586,105 @@ fn applies_relative_positioning_offsets() {
 
     assert!(raw.contains("1 0 0 1 94 "));
 }
+
+fn text_matrices(raw: &str) -> Vec<(f32, f32)> {
+    raw.match_indices("1 0 0 1 ")
+        .filter_map(|(index, _)| {
+            let rest = &raw[index + "1 0 0 1 ".len()..];
+            let end = rest.find(" Tm")?;
+            let values = rest[..end]
+                .split_whitespace()
+                .filter_map(|value| value.parse::<f32>().ok())
+                .collect::<Vec<_>>();
+            if values.len() >= 2 {
+                Some((values[0], values[1]))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn renders_background_image_with_opacity_and_radius() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+         background-repeat: no-repeat; opacity: 0.5; border-radius: 6pt }}</style>\
+         <div>Latar</div>"
+    ));
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/ExtGState"));
+    assert!(raw.contains("/GS1"));
+    assert!(raw.contains(" gs"));
+    assert!(raw.contains("Im1 Do"));
+}
+
+#[test]
+fn renders_absolute_overlay_with_z_index() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>.box { position: absolute; left: 120pt; top: 30pt; z-index: 5 }</style>\
+         <p>Isi</p><div class=\"box\">Overlay</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("1 0 0 1 174 "));
+    assert!(raw.find("(Isi)").unwrap() < raw.find("(Overlay)").unwrap());
+}
+
+#[test]
+fn resolves_css_counters_in_generated_content() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>body { counter-reset: n }\
+         h1::before { counter-increment: n; content: '[' counter(n) ']' }</style><h1>X</h1>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("([1])"));
+}
+
+#[test]
+fn sizes_table_columns_from_content() {
+    let pdf = html2pdf_rs::render_html("<table><tr><td>A</td><td>BBBBBBBBBB</td></tr></table>");
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(matrices.len() >= 2);
+    assert!(matrices[1].0 - matrices[0].0 > 40.0);
+    assert!(matrices[1].0 - matrices[0].0 < 150.0);
+}
+
+#[test]
+fn aligns_table_cell_content_to_bottom() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>td { vertical-align: bottom }</style>\
+         <table><tr><td>A</td><td>B<br>C<br>D</td></tr></table>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(matrices.len() >= 4);
+    assert!((matrices[0].1 - matrices.last().unwrap().1).abs() < 0.2);
+}
+
+#[test]
+fn repeats_table_header_across_pages() {
+    let rows = (1..=60)
+        .map(|index| format!("<tr><td>R{index}</td></tr>"))
+        .collect::<String>();
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<table><thead><tr><th>Header</th></tr></thead><tbody>{rows}</tbody></table>"
+    ));
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.matches("(Header)").count() >= 2);
+}

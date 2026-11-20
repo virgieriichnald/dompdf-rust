@@ -3,7 +3,7 @@ use pdf_writer::types::{
 };
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
-use crate::css::TextAlign;
+use crate::css::{BackgroundRepeat, BackgroundSize, TextAlign};
 use crate::layout::{Document, FontId, InlineItem, Page};
 
 struct FontRefs {
@@ -55,6 +55,14 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         .collect::<Vec<_>>();
     let destinations_id = Ref::new(next_id);
     next_id += 1;
+    let opacities = collect_opacities(document);
+    let state_ids = (0..opacities.len())
+        .map(|_| {
+            let id = Ref::new(next_id);
+            next_id += 1;
+            id
+        })
+        .collect::<Vec<_>>();
     let destinations = document
         .anchors
         .iter()
@@ -113,6 +121,12 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             .encoding_predefined(Name(b"WinAnsiEncoding"));
     }
 
+    for (&id, &alpha) in state_ids.iter().zip(opacities.iter()) {
+        pdf.ext_graphics(id)
+            .non_stroking_alpha(alpha)
+            .stroking_alpha(alpha);
+    }
+
     for (asset, &id) in document.images.iter().zip(image_refs.iter()) {
         pdf.image_xobject(id, asset.pixels.as_slice())
             .width(asset.width as i32)
@@ -130,7 +144,7 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         let page_id = page_ids[page_index];
         let content_id = content_ids[page_index];
 
-        let content = build_content(page, document, page_index, document.pages.len());
+        let content = build_content(page, document, page_index, document.pages.len(), &opacities);
         pdf.stream(content_id, content.as_slice()).finish();
 
         let mut links = Vec::new();
@@ -185,6 +199,14 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
                 fonts.pair(Name(name.as_bytes()), font_refs[index].type0);
             }
             fonts.finish();
+
+            if !state_ids.is_empty() {
+                let mut states = resources.ext_g_states();
+                for (index, &id) in state_ids.iter().enumerate() {
+                    let name = format!("GS{}", index + 1);
+                    states.pair(Name(name.as_bytes()), id);
+                }
+            }
 
             let mut x_objects = resources.x_objects();
             for (index, &id) in image_refs.iter().enumerate() {
@@ -317,18 +339,99 @@ fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
     bytes
 }
 
+fn collect_opacities(document: &Document) -> Vec<f32> {
+    let mut values: Vec<f32> = Vec::new();
+    for page in &document.pages {
+        for line in &page.lines {
+            let alpha = line.opacity.clamp(0.0, 1.0);
+            if alpha < 0.999 && !values.iter().any(|value| (*value - alpha).abs() < 0.001) {
+                values.push(alpha);
+            }
+        }
+    }
+    values
+}
+
+fn rounded_rect_path(content: &mut Content, x: f32, y: f32, width: f32, height: f32, radius: f32) {
+    let radius = radius.min(width * 0.5).min(height * 0.5).max(0.0);
+    if radius == 0.0 {
+        content.rect(x, y, width, height);
+        return;
+    }
+
+    let k = radius * 0.552_284_8;
+    content
+        .move_to(x + radius, y)
+        .line_to(x + width - radius, y)
+        .cubic_to(
+            x + width - radius + k,
+            y,
+            x + width,
+            y + radius - k,
+            x + width,
+            y + radius,
+        )
+        .line_to(x + width, y + height - radius)
+        .cubic_to(
+            x + width,
+            y + height - radius + k,
+            x + width - radius + k,
+            y + height,
+            x + width - radius,
+            y + height,
+        )
+        .line_to(x + radius, y + height)
+        .cubic_to(
+            x + radius - k,
+            y + height,
+            x,
+            y + height - radius + k,
+            x,
+            y + height - radius,
+        )
+        .line_to(x, y + radius)
+        .cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y)
+        .close_path();
+}
+
 fn build_content(
     page: &Page,
     document: &Document,
     page_index: usize,
     page_count: usize,
+    opacities: &[f32],
 ) -> Vec<u8> {
     let mut content = Content::new();
     let width = page.geometry.width;
     let height = page.geometry.height;
     let margin = page.geometry.margin;
 
-    for line in &page.lines {
+    let mut drawable = page
+        .lines
+        .iter()
+        .map(|line| (0, line))
+        .chain(
+            page.overlays
+                .iter()
+                .map(|overlay| (overlay.z, &overlay.line)),
+        )
+        .collect::<Vec<_>>();
+    drawable.sort_by_key(|(z, _)| *z);
+
+    for (_, line) in drawable {
+        let alpha_state = if line.opacity < 0.999 {
+            opacities
+                .iter()
+                .position(|value| (value - line.opacity).abs() < 0.001)
+        } else {
+            None
+        };
+        if let Some(state) = alpha_state {
+            content.save_state();
+            let name = format!("GS{}", state + 1);
+            content.op("gs").operand(Name(name.as_bytes()));
+        }
+
         let x = match line.align {
             TextAlign::Left | TextAlign::Justify => margin,
             TextAlign::Center => margin + (width - 2.0 * margin - line.width) / 2.0,
@@ -337,11 +440,77 @@ fn build_content(
         let line_y = height - margin - line.top - line.height;
         let line_width = line.background_width.unwrap_or(line.width);
 
+        if let Some(index) = line.background_image
+            && let Some(asset) = document.images.get(index)
+        {
+            let natural_width = asset.width as f32 * document.px_scale;
+            let natural_height = asset.height as f32 * document.px_scale;
+            let (tile_width, tile_height) = match line.background_size {
+                BackgroundSize::Auto => (natural_width, natural_height),
+                BackgroundSize::Cover => {
+                    let scale = line_width / natural_width.max(1.0);
+                    let cover = line.height / natural_height.max(1.0);
+                    let scale = scale.max(cover);
+                    (natural_width * scale, natural_height * scale)
+                }
+                BackgroundSize::Contain => {
+                    let scale = line_width / natural_width.max(1.0);
+                    let contain = line.height / natural_height.max(1.0);
+                    let scale = scale.min(contain);
+                    (natural_width * scale, natural_height * scale)
+                }
+            };
+            if tile_width > 0.0 && tile_height > 0.0 {
+                content.save_state();
+                rounded_rect_path(
+                    &mut content,
+                    margin + line.left,
+                    line_y,
+                    line_width,
+                    line.height,
+                    line.border_radius,
+                );
+                content.clip_nonzero();
+                let name = format!("Im{}", index + 1);
+                let mut y = line_y;
+                while y < line_y + line.height {
+                    let mut x_tile = margin + line.left;
+                    while x_tile < margin + line.left + line_width {
+                        content
+                            .transform([
+                                tile_width,
+                                0.0,
+                                0.0,
+                                tile_height,
+                                x_tile,
+                                y + line.height - tile_height,
+                            ])
+                            .x_object(Name(name.as_bytes()));
+                        if line.background_repeat == BackgroundRepeat::NoRepeat {
+                            break;
+                        }
+                        x_tile += tile_width;
+                    }
+                    if line.background_repeat == BackgroundRepeat::NoRepeat {
+                        break;
+                    }
+                    y += tile_height;
+                }
+                content.restore_state();
+            }
+        }
+
         if let Some(color) = line.background {
-            content
-                .set_fill_rgb(color[0], color[1], color[2])
-                .rect(margin + line.left, line_y, line_width, line.height)
-                .fill_nonzero();
+            content.set_fill_rgb(color[0], color[1], color[2]);
+            rounded_rect_path(
+                &mut content,
+                margin + line.left,
+                line_y,
+                line_width,
+                line.height,
+                line.border_radius,
+            );
+            content.fill_nonzero();
         }
 
         if let Some(border) = line.border {
@@ -351,7 +520,25 @@ fn build_content(
                 .set_fill_rgb(color[0], color[1], color[2])
                 .set_line_width(width);
 
-            if border.top {
+            let rounded = line.border_radius > 0.0
+                && border.top
+                && border.bottom
+                && border.left
+                && border.right;
+            if rounded {
+                content.set_stroke_rgb(color[0], color[1], color[2]);
+                rounded_rect_path(
+                    &mut content,
+                    margin + line.left + width * 0.5,
+                    line_y + width * 0.5,
+                    line_width - width,
+                    line.height - width,
+                    line.border_radius,
+                );
+                content.stroke();
+            }
+
+            if border.top && !rounded {
                 content.rect(
                     margin + line.left,
                     line_y + line.height - width,
@@ -359,13 +546,13 @@ fn build_content(
                     width,
                 );
             }
-            if border.bottom {
+            if border.bottom && !rounded {
                 content.rect(margin + line.left, line_y, line_width, width);
             }
-            if border.left {
+            if border.left && !rounded {
                 content.rect(margin + line.left, line_y, width, line.height);
             }
-            if border.right {
+            if border.right && !rounded {
                 content.rect(
                     margin + line.left + line_width - width,
                     line_y,
@@ -473,6 +660,10 @@ fn build_content(
                     cursor += image.width;
                 }
             }
+        }
+
+        if alpha_state.is_some() {
+            content.restore_state();
         }
     }
 

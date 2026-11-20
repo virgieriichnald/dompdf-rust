@@ -5,9 +5,10 @@ use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
 use crate::css::{
-    BorderSpec, Display, FontFace, ListStyle, MediaContext, PageRules, Position, PseudoElement,
-    Rule, Style, TextAlign, WhiteSpace, parse_color, parse_font_faces, parse_length,
-    parse_page_rules, parse_styles, pseudo_style_for, px_scale, style_for,
+    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Display, FontFace, Length,
+    ListStyle, MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign,
+    VerticalAlign, WhiteSpace, parse_color, parse_font_faces, parse_length, parse_page_rules,
+    parse_styles, pseudo_style_for, px_scale, style_for,
 };
 use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
@@ -96,6 +97,31 @@ pub struct Anchor {
 }
 
 #[derive(Clone, Debug)]
+struct BlockStyle {
+    background: Option<[f32; 3]>,
+    background_image: Option<usize>,
+    background_repeat: BackgroundRepeat,
+    background_size: BackgroundSize,
+    border: Option<BorderSpec>,
+    opacity: f32,
+    border_radius: f32,
+}
+
+impl Default for BlockStyle {
+    fn default() -> Self {
+        Self {
+            background: None,
+            background_image: None,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_size: BackgroundSize::Auto,
+            border: None,
+            opacity: 1.0,
+            border_radius: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Line {
     pub items: Vec<InlineItem>,
     pub width: f32,
@@ -106,8 +132,13 @@ pub struct Line {
     pub left: f32,
     pub align: TextAlign,
     pub background: Option<[f32; 3]>,
+    pub background_image: Option<usize>,
+    pub background_repeat: BackgroundRepeat,
+    pub background_size: BackgroundSize,
     pub background_width: Option<f32>,
     pub border: Option<BorderSpec>,
+    pub opacity: f32,
+    pub border_radius: f32,
     pub links: Vec<LinkRect>,
 }
 
@@ -119,8 +150,15 @@ pub struct PageGeometry {
 }
 
 #[derive(Clone, Debug)]
+pub struct Overlay {
+    pub line: Line,
+    pub z: i32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Page {
     pub lines: Vec<Line>,
+    pub overlays: Vec<Overlay>,
     pub geometry: PageGeometry,
 }
 
@@ -164,6 +202,7 @@ pub struct Document {
     pub margin: f32,
     pub page_text: Option<String>,
     pub page_text_location: PageTextLocation,
+    pub px_scale: f32,
 }
 
 impl Document {
@@ -246,6 +285,7 @@ impl Document {
             margin: options.margin,
             page_text: options.page_text.clone(),
             page_text_location: options.page_text_location,
+            px_scale: base_style.px_scale,
         }
     }
 }
@@ -357,11 +397,12 @@ struct Collector {
     image_cache: HashMap<String, Option<usize>>,
     fonts: Vec<EmbeddedFont>,
     font_cache: HashMap<String, Option<usize>>,
-    background: Option<[f32; 3]>,
-    border: Option<BorderSpec>,
-    style_stack: Vec<(Option<[f32; 3]>, Option<BorderSpec>)>,
+    block: BlockStyle,
+    style_stack: Vec<BlockStyle>,
     link: Option<String>,
     lists: Vec<ListState>,
+    counters: HashMap<String, Vec<i32>>,
+    counter_stack: Vec<HashMap<String, Vec<i32>>>,
     px_scale: f32,
     image_byte_limit: Option<usize>,
     policy: ResourcePolicy,
@@ -381,6 +422,7 @@ impl Collector {
         Self {
             pages: vec![Page {
                 lines: Vec::new(),
+                overlays: Vec::new(),
                 geometry,
             }],
             anchors: Vec::new(),
@@ -404,11 +446,12 @@ impl Collector {
             image_cache: HashMap::new(),
             fonts: Vec::new(),
             font_cache: HashMap::new(),
-            background: None,
-            border: None,
+            block: BlockStyle::default(),
             style_stack: Vec::new(),
             link: None,
             lists: Vec::new(),
+            counters: HashMap::new(),
+            counter_stack: Vec::new(),
             px_scale,
             image_byte_limit,
             policy,
@@ -434,6 +477,7 @@ impl Collector {
         let geometry = self.geometry_for(index);
         self.pages.push(Page {
             lines: Vec::new(),
+            overlays: Vec::new(),
             geometry,
         });
         self.apply_geometry(geometry);
@@ -446,12 +490,23 @@ impl Collector {
 
     fn push_line(&mut self, mut line: Line) {
         if line.background.is_none() {
-            line.background = self.background;
+            line.background = self.block.background;
+        }
+        if line.background_image.is_none() {
+            line.background_image = self.block.background_image;
+            line.background_repeat = self.block.background_repeat;
+            line.background_size = self.block.background_size;
         }
         if line.border.is_none() {
-            line.border = self.border;
+            line.border = self.block.border;
         }
-        if line.background_width.is_none() && self.background.is_some() {
+        line.opacity *= self.block.opacity;
+        if line.border_radius == 0.0 {
+            line.border_radius = self.block.border_radius;
+        }
+        if line.background_width.is_none()
+            && (self.block.background.is_some() || self.block.background_image.is_some())
+        {
             line.background_width = Some(self.max_width);
         }
         if line.links.is_empty() {
@@ -500,8 +555,13 @@ impl Collector {
             left: 0.0,
             align: self.align,
             background: None,
+            background_image: None,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_size: BackgroundSize::Auto,
             background_width: None,
             border: None,
+            opacity: 1.0,
+            border_radius: 0.0,
             links: Vec::new(),
         };
 
@@ -513,7 +573,9 @@ impl Collector {
 
     fn start_block(&mut self, style: &Style) {
         self.flush_line();
-        self.style_stack.push((self.background, self.border));
+        self.style_stack.push(self.block.clone());
+        self.counter_stack.push(self.counters.clone());
+        apply_counter_style(&mut self.counters, style);
         self.offset_stack.push((self.offset_x, self.offset_y));
         if style.position == Position::Relative {
             let dx = if let Some(left) = style.offset_left {
@@ -536,10 +598,19 @@ impl Collector {
             self.offset_y += dy;
         }
         if style.background.is_some() {
-            self.background = style.background;
+            self.block.background = style.background;
         }
+        if let Some(url) = &style.background_image {
+            self.block.background_image = self.load_image_index(url);
+        }
+        self.block.background_repeat = style.background_repeat;
+        self.block.background_size = style.background_size;
         if style.border.is_some() {
-            self.border = style.border;
+            self.block.border = style.border;
+        }
+        self.block.opacity *= style.opacity;
+        if style.border_radius > 0.0 {
+            self.block.border_radius = style.border_radius;
         }
         self.pending_before = self.pending_before.max(style.margin_top_pt());
         self.pending_indent = style.text_indent_pt();
@@ -553,9 +624,11 @@ impl Collector {
             last.space_after = last.space_after.max(margin);
         }
         self.cursor += margin;
-        if let Some((background, border)) = self.style_stack.pop() {
-            self.background = background;
-            self.border = border;
+        if let Some(block) = self.style_stack.pop() {
+            self.block = block;
+        }
+        if let Some(counters) = self.counter_stack.pop() {
+            self.counters = counters;
         }
         if let Some((x, y)) = self.offset_stack.pop() {
             self.offset_x = x;
@@ -676,6 +749,36 @@ impl Collector {
         self.width += width;
     }
 
+    fn load_image_index(&mut self, src: &str) -> Option<usize> {
+        let key = src.to_string();
+        if let Some(cached) = self.image_cache.get(&key) {
+            return *cached;
+        }
+
+        let loaded = read_bytes(src, &self.base, &self.policy)
+            .and_then(|bytes| {
+                if self
+                    .image_byte_limit
+                    .is_some_and(|limit| bytes.len() > limit)
+                {
+                    return None;
+                }
+                if src.to_ascii_lowercase().ends_with(".svg") {
+                    String::from_utf8(bytes)
+                        .ok()
+                        .and_then(|text| render_svg(&text))
+                } else {
+                    load_image_bytes(&bytes)
+                }
+            })
+            .map(|asset| {
+                self.images.push(asset);
+                self.images.len() - 1
+            });
+        self.image_cache.insert(key, loaded);
+        loaded
+    }
+
     fn push_image(
         &mut self,
         src: &str,
@@ -684,35 +787,7 @@ impl Collector {
         attr_height: Option<f32>,
         style: &Style,
     ) {
-        let key = src.to_string();
-        let index = if let Some(cached) = self.image_cache.get(&key) {
-            *cached
-        } else {
-            let loaded = read_bytes(src, &self.base, &self.policy)
-                .and_then(|bytes| {
-                    if self
-                        .image_byte_limit
-                        .is_some_and(|limit| bytes.len() > limit)
-                    {
-                        return None;
-                    }
-                    if src.to_ascii_lowercase().ends_with(".svg") {
-                        String::from_utf8(bytes)
-                            .ok()
-                            .and_then(|text| render_svg(&text))
-                    } else {
-                        load_image_bytes(&bytes)
-                    }
-                })
-                .map(|asset| {
-                    self.images.push(asset);
-                    self.images.len() - 1
-                });
-            self.image_cache.insert(key, loaded);
-            loaded
-        };
-
-        let Some(index) = index else {
+        let Some(index) = self.load_image_index(src) else {
             self.push_text(alt, style);
             return;
         };
@@ -937,13 +1012,69 @@ fn dec2roman(value: i64) -> String {
     roman
 }
 
-fn resolve_generated_content(input: &str, element: &ElementRef) -> Option<String> {
+fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
+    if let Some((name, value)) = &style.counter_reset {
+        counters.insert(name.clone(), vec![*value]);
+    }
+    if let Some((name, delta)) = &style.counter_increment {
+        let values = counters.entry(name.clone()).or_insert_with(|| vec![0]);
+        if let Some(last) = values.last_mut() {
+            *last += delta;
+        } else {
+            values.push(*delta);
+        }
+    }
+}
+
+fn format_counter(counters: &HashMap<String, Vec<i32>>, name: &str) -> String {
+    counters
+        .get(name)
+        .and_then(|values| values.last())
+        .copied()
+        .unwrap_or(0)
+        .to_string()
+}
+
+fn format_counters(counters: &HashMap<String, Vec<i32>>, name: &str, separator: &str) -> String {
+    counters
+        .get(name)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(separator)
+        })
+        .unwrap_or_else(|| "0".to_string())
+}
+
+fn resolve_generated_content(
+    input: &str,
+    element: &ElementRef,
+    counters: &HashMap<String, Vec<i32>>,
+) -> Option<String> {
     let mut output = String::new();
     let mut rest = input.trim();
 
     while !rest.is_empty() {
         let quote = rest.chars().next()?;
-        if quote == '"' || quote == '\'' {
+        if let Some(after) = rest.strip_prefix("counters(") {
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            let mut args = after[..end].split(',');
+            let name = args.next().unwrap_or("").trim().trim_matches(['"', '\'']);
+            let separator = args.next().unwrap_or(".").trim().trim_matches(['"', '\'']);
+            output.push_str(&format_counters(counters, name, separator));
+            rest = after[end + 1..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("counter(") {
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            let name = after[..end].trim().trim_matches(['"', '\'']);
+            output.push_str(&format_counter(counters, name));
+            rest = after[end + 1..].trim_start();
+        } else if quote == '"' || quote == '\'' {
             let Some(end) = rest[1..].find(quote) else {
                 break;
             };
@@ -1034,6 +1165,12 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             .map(|href| resolve_uri(href, &collector.base));
     }
 
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        layout_overlay(&element, &style, rules, collector);
+        collector.link = previous_link;
+        return;
+    }
+
     if tag == "br" {
         collector.flush_line();
         collector.link = previous_link;
@@ -1114,14 +1251,18 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
 
     let before_style = pseudo_style_for(&element, &style, rules, PseudoElement::Before);
     let after_style = pseudo_style_for(&element, &style, rules, PseudoElement::After);
+    let mut before_counters = collector.counters.clone();
+    apply_counter_style(&mut before_counters, &before_style);
+    let mut after_counters = before_counters.clone();
+    apply_counter_style(&mut after_counters, &after_style);
     let before_content = before_style
         .content
         .as_deref()
-        .and_then(|content| resolve_generated_content(content, &element));
+        .and_then(|content| resolve_generated_content(content, &element, &before_counters));
     let after_content = after_style
         .content
         .as_deref()
-        .and_then(|content| resolve_generated_content(content, &element));
+        .and_then(|content| resolve_generated_content(content, &element, &after_counters));
 
     if let Some(content) = &before_content {
         collector.push_text(content, &before_style);
@@ -1156,6 +1297,111 @@ struct TableCell<'a> {
     rowspan: usize,
 }
 
+#[derive(Clone)]
+struct PreparedCell {
+    column: usize,
+    colspan: usize,
+    style: Style,
+    lines: Vec<Line>,
+}
+
+#[derive(Clone)]
+struct PreparedRow {
+    height: f32,
+    cells: Vec<PreparedCell>,
+}
+
+fn prepare_cell_style(
+    cell: &TableCell<'_>,
+    style: &Style,
+    rules: &[Rule],
+    padding: Option<Length>,
+) -> Style {
+    let mut cell_style = style_for(&cell.element, style, rules);
+    let owns_padding = cell
+        .element
+        .attr("style")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("padding"));
+    if !owns_padding && let Some(padding) = padding {
+        cell_style.padding_top = padding;
+        cell_style.padding_right = padding;
+        cell_style.padding_bottom = padding;
+        cell_style.padding_left = padding;
+    }
+    cell_style
+}
+
+fn column_offset(widths: &[f32], spacing: f32, column: usize) -> f32 {
+    widths[..column].iter().copied().sum::<f32>() + spacing * column as f32
+}
+
+fn cell_span_width(widths: &[f32], spacing: f32, column: usize, colspan: usize) -> f32 {
+    widths[column..(column + colspan).min(widths.len())]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        + spacing * colspan.saturating_sub(1) as f32
+}
+
+fn emit_prepared_row(
+    collector: &mut Collector,
+    row: &PreparedRow,
+    top: f32,
+    widths: &[f32],
+    spacing: f32,
+) {
+    for cell in &row.cells {
+        let x = column_offset(widths, spacing, cell.column);
+        let cell_width = cell_span_width(widths, spacing, cell.column, cell.colspan);
+        let padding_left = cell.style.padding_left_pt();
+        let padding_top = cell.style.padding_top_pt();
+        let content_height = cell
+            .lines
+            .iter()
+            .map(|line| line.space_before + line.height + line.space_after)
+            .sum::<f32>();
+        let free = (row.height - content_height).max(0.0);
+        let content_offset = match cell.style.vertical_align {
+            VerticalAlign::Top => 0.0,
+            VerticalAlign::Middle => free * 0.5,
+            VerticalAlign::Bottom => free,
+            VerticalAlign::Baseline => 0.0,
+        };
+
+        let box_line = Line {
+            items: Vec::new(),
+            width: cell_width,
+            height: row.height,
+            space_before: 0.0,
+            space_after: 0.0,
+            top,
+            left: x,
+            align: TextAlign::Left,
+            background: cell.style.background,
+            background_image: cell
+                .style
+                .background_image
+                .as_deref()
+                .and_then(|url| collector.load_image_index(url)),
+            background_repeat: cell.style.background_repeat,
+            background_size: cell.style.background_size,
+            background_width: Some(cell_width),
+            border: cell.style.border,
+            opacity: cell.style.opacity,
+            border_radius: cell.style.border_radius,
+            links: Vec::new(),
+        };
+        collector.push_line(box_line);
+
+        for line in &cell.lines {
+            let mut line = line.clone();
+            line.top += top + padding_top + content_offset;
+            line.left += x + padding_left;
+            collector.push_line(line);
+        }
+    }
+}
+
 fn layout_table<'a>(
     table: &ElementRef<'a>,
     style: &Style,
@@ -1168,8 +1414,13 @@ fn layout_table<'a>(
         return;
     }
 
-    let cell_padding = table.attr("cellpadding").and_then(parse_length);
     let table_background = table.attr("bgcolor").and_then(parse_color);
+    let cell_padding = table.attr("cellpadding").and_then(parse_length);
+    let spacing = if style.border_collapse == BorderCollapse::Collapse {
+        0.0
+    } else {
+        style.border_spacing.max(0.0)
+    };
 
     let mut grid = Vec::<Vec<Option<TableCell>>>::new();
     let mut cursors = Vec::new();
@@ -1210,28 +1461,73 @@ fn layout_table<'a>(
             let rowspan = parse_positive_attr(cell.attr("rowspan")).unwrap_or(1);
             let item = TableCell {
                 element: cell,
-                colspan,
+                colspan: colspan.min(column_count - column),
                 rowspan,
             };
 
             let row_end = (row_index + rowspan).min(grid.len());
-            let column_end = (column + colspan).min(column_count);
+            let column_end = (column + item.colspan).min(column_count);
             for row in grid.iter_mut().take(row_end).skip(row_index) {
                 for slot in row.iter_mut().take(column_end).skip(column) {
                     *slot = Some(item.clone());
                 }
             }
-            cursors[row_index] = column + colspan;
+            cursors[row_index] = column + item.colspan;
         }
     }
 
-    let column_width = collector.max_width / column_count as f32;
+    let mut desired = vec![0.0f32; column_count];
+    let mut measured = HashSet::new();
+    for (row_index, row) in grid.iter().enumerate() {
+        for (column_index, cell) in row.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            if !measured.insert((row_index, column_index)) {
+                continue;
+            }
+            let cell_style = prepare_cell_style(cell, style, rules, cell_padding);
+            let text = cell.element.text().collect::<String>();
+            let natural = cell
+                .element
+                .attr("width")
+                .and_then(parse_length)
+                .map(|length| length.resolve_with(cell_style.font_size, cell_style.px_scale))
+                .unwrap_or_else(|| collector.text_width(text.trim(), &cell_style));
+            let padding = cell_style.padding_left_pt() + cell_style.padding_right_pt();
+            let needed = (natural + padding) / cell.colspan as f32;
+            for column in desired
+                .iter_mut()
+                .take((column_index + cell.colspan).min(column_count))
+                .skip(column_index)
+            {
+                *column = (*column).max(needed);
+            }
+        }
+    }
+
+    let available =
+        (collector.max_width - spacing * column_count.saturating_sub(1) as f32).max(1.0);
+    let desired_total: f32 = desired.iter().sum();
+    let column_widths = if desired_total <= 0.0 {
+        vec![available / column_count as f32; column_count]
+    } else {
+        desired
+            .iter()
+            .map(|width| (width / desired_total * available).max(1.0))
+            .collect::<Vec<_>>()
+    };
     let table_space = style.margin_top_pt();
+    let header_ptrs = table
+        .select(&Selector::parse("thead tr").expect("valid selector"))
+        .map(|row| row.value() as *const _ as usize)
+        .collect::<HashSet<_>>();
+    let mut header_row: Option<PreparedRow> = None;
 
     for row_index in 0..grid.len() {
-        let mut prepared = Vec::new();
+        let mut prepared = PreparedRow {
+            height: 0.0,
+            cells: Vec::new(),
+        };
         let mut visited = HashSet::new();
-        let mut row_height: f32 = 0.0;
 
         for column_index in 0..column_count {
             let Some(cell) = grid[row_index][column_index].clone() else {
@@ -1246,17 +1542,7 @@ fn layout_table<'a>(
                 }
             }
 
-            let mut cell_style = style_for(&cell.element, style, rules);
-            let owns_padding = cell
-                .element
-                .attr("style")
-                .is_some_and(|value| value.to_ascii_lowercase().contains("padding"));
-            if !owns_padding && let Some(padding) = cell_padding {
-                cell_style.padding_top = padding;
-                cell_style.padding_right = padding;
-                cell_style.padding_bottom = padding;
-                cell_style.padding_left = padding;
-            }
+            let mut cell_style = prepare_cell_style(&cell, style, rules, cell_padding);
             if cell_style.background.is_none() {
                 cell_style.background = table_background;
             }
@@ -1264,7 +1550,7 @@ fn layout_table<'a>(
             let padding_right = cell_style.padding_right_pt();
             let padding_top = cell_style.padding_top_pt();
             let padding_bottom = cell_style.padding_bottom_pt();
-            let cell_width = column_width * cell.colspan as f32;
+            let cell_width = cell_span_width(&column_widths, spacing, column_index, cell.colspan);
             let content_width = (cell_width - padding_left - padding_right).max(1.0);
 
             let saved_max = collector.max_width;
@@ -1272,8 +1558,7 @@ fn layout_table<'a>(
             let saved_cursor = collector.cursor;
             let saved_align = collector.align;
             let saved_pending = collector.pending_before;
-            let saved_background = collector.background;
-            let saved_border = collector.border;
+            let saved_block = collector.block.clone();
             let saved_stack_len = collector.style_stack.len();
             let saved_pages = collector.pages.len();
 
@@ -1283,8 +1568,7 @@ fn layout_table<'a>(
             collector.new_page();
             collector.align = cell_style.text_align;
             collector.pending_before = 0.0;
-            collector.background = None;
-            collector.border = None;
+            collector.block = BlockStyle::default();
 
             for child in cell.element.children() {
                 if let Some(child_element) = ElementRef::wrap(child) {
@@ -1298,8 +1582,11 @@ fn layout_table<'a>(
             let mut lines = collector.pages.pop().expect("cell page").lines;
             for line in &mut lines {
                 line.background = None;
+                line.background_image = None;
                 line.border = None;
                 line.background_width = None;
+                line.opacity *= cell_style.opacity;
+                line.border_radius = cell_style.border_radius;
             }
             collector.pages.truncate(saved_pages);
             collector.style_stack.truncate(saved_stack_len);
@@ -1308,49 +1595,168 @@ fn layout_table<'a>(
             collector.cursor = saved_cursor;
             collector.align = saved_align;
             collector.pending_before = saved_pending;
-            collector.background = saved_background;
-            collector.border = saved_border;
+            collector.block = saved_block;
 
             let content_height = lines
                 .iter()
                 .map(|line| line.space_before + line.height + line.space_after)
                 .sum::<f32>();
-            let height = (content_height + padding_top + padding_bottom).max(12.0);
-            row_height = row_height.max(height);
-            prepared.push((column_index, cell.colspan, cell_style, lines));
+            prepared.height = prepared
+                .height
+                .max(content_height + padding_top + padding_bottom)
+                .max(12.0);
+            prepared.cells.push(PreparedCell {
+                column: column_index,
+                colspan: cell.colspan,
+                style: cell_style,
+                lines,
+            });
         }
 
+        let is_header = header_ptrs.contains(&(rows[row_index].value() as *const _ as usize));
         let space_before = if row_index == 0 { table_space } else { 0.0 };
-        let row_top = collector.reserve(row_height, space_before);
-
-        for (column_index, colspan, cell_style, lines) in prepared {
-            let x = column_index as f32 * column_width;
-            let cell_width = column_width * colspan as f32;
-            let padding_left = cell_style.padding_left_pt();
-            let padding_top = cell_style.padding_top_pt();
-
-            let box_line = Line {
-                items: Vec::new(),
-                width: cell_width,
-                height: row_height,
-                space_before: 0.0,
-                space_after: 0.0,
-                top: row_top,
-                left: x,
-                align: TextAlign::Left,
-                background: cell_style.background,
-                background_width: Some(cell_width),
-                border: cell_style.border,
-                links: Vec::new(),
-            };
-            collector.push_line(box_line);
-
-            for mut line in lines {
-                line.top += row_top + padding_top;
-                line.left += x + padding_left;
-                collector.push_line(line);
-            }
+        if let Some(header) = &header_row
+            && !is_header
+            && !collector.page_is_empty()
+            && collector.cursor + space_before + prepared.height + header.height
+                > collector.page_height
+        {
+            let header_top = collector.reserve(header.height, 0.0);
+            emit_prepared_row(collector, header, header_top, &column_widths, spacing);
         }
+
+        let row_top = collector.reserve(prepared.height, space_before);
+        emit_prepared_row(collector, &prepared, row_top, &column_widths, spacing);
+        if spacing > 0.0 {
+            collector.cursor += spacing;
+        }
+        if is_header && header_row.is_none() {
+            header_row = Some(prepared);
+        }
+    }
+}
+
+fn layout_overlay<'a>(
+    element: &ElementRef<'a>,
+    style: &Style,
+    rules: &[Rule],
+    collector: &mut Collector,
+) {
+    let saved_max = collector.max_width;
+    let saved_page_height = collector.page_height;
+    let saved_cursor = collector.cursor;
+    let saved_align = collector.align;
+    let saved_pending = collector.pending_before;
+    let saved_block = collector.block.clone();
+    let saved_stack_len = collector.style_stack.len();
+    let saved_pages = collector.pages.len();
+
+    let content_width = (collector.max_width * 0.6).max(1.0);
+    collector.max_width = content_width;
+    collector.page_height = f32::MAX;
+    collector.cursor = 0.0;
+    collector.new_page();
+    collector.align = style.text_align;
+    collector.pending_before = 0.0;
+    collector.block = BlockStyle {
+        background: style.background,
+        border: style.border,
+        opacity: style.opacity,
+        border_radius: style.border_radius,
+        ..BlockStyle::default()
+    };
+
+    for child in element.children() {
+        if let Some(child_element) = ElementRef::wrap(child) {
+            walk(child_element, style, rules, collector);
+        } else if let Some(text) = child.value().as_text() {
+            collector.push_text(text, style);
+        }
+    }
+    collector.flush_line();
+
+    let mut lines = collector.pages.pop().expect("overlay page").lines;
+    for line in &mut lines {
+        line.opacity *= style.opacity;
+    }
+    collector.pages.truncate(saved_pages);
+    collector.style_stack.truncate(saved_stack_len);
+    collector.max_width = saved_max;
+    collector.page_height = saved_page_height;
+    collector.cursor = saved_cursor;
+    collector.align = saved_align;
+    collector.pending_before = saved_pending;
+    collector.block = saved_block;
+
+    let padding_left = style.padding_left_pt();
+    let padding_right = style.padding_right_pt();
+    let padding_top = style.padding_top_pt();
+    let padding_bottom = style.padding_bottom_pt();
+    let text_width = lines.iter().map(|line| line.width).fold(0.0f32, f32::max);
+    let content_height = lines
+        .iter()
+        .map(|line| line.space_before + line.height + line.space_after)
+        .sum::<f32>();
+    let box_width = (text_width + padding_left + padding_right).max(54.0);
+    let box_height = (content_height + padding_top + padding_bottom).max(18.0);
+
+    let resolve = |value: Option<Length>| {
+        value
+            .map(|length| length.resolve_with(style.font_size, style.px_scale))
+            .unwrap_or(0.0)
+    };
+    let x = if let Some(left) = style.offset_left {
+        resolve(Some(left))
+    } else if style.offset_right.is_some() {
+        saved_max - box_width - resolve(style.offset_right)
+    } else {
+        0.0
+    };
+    let y = if let Some(top) = style.offset_top {
+        resolve(Some(top))
+    } else if style.offset_bottom.is_some() {
+        saved_page_height - box_height - resolve(style.offset_bottom)
+    } else {
+        0.0
+    };
+
+    let background_image = style
+        .background_image
+        .as_deref()
+        .and_then(|url| collector.load_image_index(url));
+
+    let page = collector.pages.last_mut().expect("page exists");
+    page.overlays.push(Overlay {
+        z: style.z_index,
+        line: Line {
+            items: Vec::new(),
+            width: box_width,
+            height: box_height,
+            space_before: 0.0,
+            space_after: 0.0,
+            top: y,
+            left: x,
+            align: TextAlign::Left,
+            background: style.background,
+            background_image,
+            background_repeat: style.background_repeat,
+            background_size: style.background_size,
+            background_width: Some(box_width),
+            border: style.border,
+            opacity: style.opacity,
+            border_radius: style.border_radius,
+            links: Vec::new(),
+        },
+    });
+
+    let overlays = &mut collector.pages.last_mut().expect("page exists").overlays;
+    for mut line in lines {
+        line.top += y + padding_top;
+        line.left += x + padding_left;
+        overlays.push(Overlay {
+            z: style.z_index,
+            line,
+        });
     }
 }
 

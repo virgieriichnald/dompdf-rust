@@ -246,7 +246,15 @@ pub struct Style {
     pub padding_bottom: Length,
     pub padding_left: Length,
     pub background: Option<[f32; 3]>,
+    pub background_image: Option<String>,
+    pub background_repeat: BackgroundRepeat,
+    pub background_size: BackgroundSize,
     pub border: Option<BorderSpec>,
+    pub opacity: f32,
+    pub border_radius: f32,
+    pub border_collapse: BorderCollapse,
+    pub border_spacing: f32,
+    pub vertical_align: VerticalAlign,
     pub text_align: TextAlign,
     pub display: Display,
     pub px_scale: f32,
@@ -256,7 +264,10 @@ pub struct Style {
     pub white_space: WhiteSpace,
     pub page_name: Option<String>,
     pub content: Option<String>,
+    pub counter_reset: Option<(String, i32)>,
+    pub counter_increment: Option<(String, i32)>,
     pub position: Position,
+    pub z_index: i32,
     pub offset_left: Option<Length>,
     pub offset_right: Option<Length>,
     pub offset_top: Option<Length>,
@@ -285,7 +296,15 @@ impl Default for Style {
             padding_bottom: Length::default(),
             padding_left: Length::default(),
             background: None,
+            background_image: None,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_size: BackgroundSize::Auto,
             border: None,
+            opacity: 1.0,
+            border_radius: 0.0,
+            border_collapse: BorderCollapse::Separate,
+            border_spacing: 0.0,
+            vertical_align: VerticalAlign::Baseline,
             text_align: TextAlign::Left,
             display: Display::Inline,
             px_scale: px_scale(DEFAULT_DPI),
@@ -295,7 +314,10 @@ impl Default for Style {
             white_space: WhiteSpace::Normal,
             page_name: None,
             content: None,
+            counter_reset: None,
+            counter_increment: None,
             position: Position::Static,
+            z_index: 0,
             offset_left: None,
             offset_right: None,
             offset_top: None,
@@ -386,6 +408,35 @@ pub struct Declaration {
 pub enum Position {
     Static,
     Relative,
+    Absolute,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundSize {
+    Auto,
+    Cover,
+    Contain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderCollapse {
+    Separate,
+    Collapse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerticalAlign {
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -880,6 +931,19 @@ fn clean_family(value: &str) -> Option<String> {
     }
 }
 
+fn parse_counter(value: &str, default: i32) -> Option<(String, i32)> {
+    let mut tokens = value.split_whitespace();
+    let name = tokens.next()?.trim_matches(['"', '\'']).to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let amount = tokens
+        .next()
+        .and_then(|token| token.parse::<i32>().ok())
+        .unwrap_or(default);
+    Some((name, amount))
+}
+
 fn extract_url(value: &str) -> Option<String> {
     let start = value.find("url(")? + 4;
     let end = value[start..].find(')')? + start;
@@ -1131,9 +1195,36 @@ pub fn parse_declarations(input: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn split_declarations(input: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut depth = 0i32;
+    for (index, ch) in input.char_indices() {
+        if let Some(marker) = quote {
+            if ch == marker {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ';' if depth == 0 => {
+                result.push(&input[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(&input[start..]);
+    result
+}
+
 pub fn parse_declarations_detailed(input: &str) -> Vec<Declaration> {
-    input
-        .split(';')
+    split_declarations(input)
+        .into_iter()
         .filter_map(|item| {
             let (property, value) = item.split_once(':')?;
             let property = property.trim().to_ascii_lowercase();
@@ -1445,11 +1536,17 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 }
             }
             "position" => {
-                style.position = if value.trim().eq_ignore_ascii_case("relative") {
-                    Position::Relative
-                } else {
-                    Position::Static
+                style.position = match value.trim().to_ascii_lowercase().as_str() {
+                    "relative" => Position::Relative,
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
+                    _ => Position::Static,
                 };
+            }
+            "z-index" => {
+                if let Ok(value) = value.trim().parse::<i32>() {
+                    style.z_index = value;
+                }
             }
             "left" => {
                 style.offset_left = parse_length_resolved(value, parent_size, style.px_scale);
@@ -1472,6 +1569,8 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                     style.content = Some(value.trim().to_string());
                 }
             }
+            "counter-reset" => style.counter_reset = parse_counter(value, 0),
+            "counter-increment" => style.counter_increment = parse_counter(value, 1),
             "font-family" => {
                 if let Some(family) = clean_family(value) {
                     style.font_family = family;
@@ -1484,6 +1583,59 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                 style.line_through = decoration.contains("line-through");
             }
             "background-color" => style.background = parse_color(value),
+            "background-image" => {
+                style.background_image = if value.trim().eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    extract_url(value)
+                };
+            }
+            "background-repeat" => {
+                style.background_repeat = if value.to_ascii_lowercase().contains("no-repeat") {
+                    BackgroundRepeat::NoRepeat
+                } else {
+                    BackgroundRepeat::Repeat
+                };
+            }
+            "background-size" => {
+                style.background_size = if value.contains("cover") {
+                    BackgroundSize::Cover
+                } else if value.contains("contain") {
+                    BackgroundSize::Contain
+                } else {
+                    BackgroundSize::Auto
+                };
+            }
+            "opacity" => {
+                if let Ok(alpha) = value.trim().parse::<f32>() {
+                    style.opacity = alpha.clamp(0.0, 1.0);
+                }
+            }
+            "border-radius" => {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                    style.border_radius = length.resolve_with(style.font_size, style.px_scale);
+                }
+            }
+            "border-collapse" => {
+                style.border_collapse = if value.trim().eq_ignore_ascii_case("collapse") {
+                    BorderCollapse::Collapse
+                } else {
+                    BorderCollapse::Separate
+                };
+            }
+            "border-spacing" => {
+                if let Some(length) = parse_length_resolved(value, parent_size, style.px_scale) {
+                    style.border_spacing = length.resolve_with(style.font_size, style.px_scale);
+                }
+            }
+            "vertical-align" => {
+                style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
+                    "top" => VerticalAlign::Top,
+                    "middle" => VerticalAlign::Middle,
+                    "bottom" => VerticalAlign::Bottom,
+                    _ => VerticalAlign::Baseline,
+                };
+            }
             "background" => {
                 if parse_color(value).is_none() {
                     for token in value.split_whitespace() {
@@ -1494,6 +1646,15 @@ fn apply_style_declarations(style: &mut Style, declarations: &[Declaration], par
                     }
                 } else {
                     style.background = parse_color(value);
+                }
+                style.background_image = extract_url(value);
+                if value.to_ascii_lowercase().contains("no-repeat") {
+                    style.background_repeat = BackgroundRepeat::NoRepeat;
+                }
+                if value.contains("cover") {
+                    style.background_size = BackgroundSize::Cover;
+                } else if value.contains("contain") {
+                    style.background_size = BackgroundSize::Contain;
                 }
             }
             "padding" => {

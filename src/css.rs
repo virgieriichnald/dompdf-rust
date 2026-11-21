@@ -274,6 +274,12 @@ pub struct Style {
     pub padding_right: Length,
     pub padding_bottom: Length,
     pub padding_left: Length,
+    pub width: Option<Length>,
+    pub height: Option<Length>,
+    pub min_width: Option<Length>,
+    pub max_width: Option<Length>,
+    pub min_height: Option<Length>,
+    pub max_height: Option<Length>,
     pub background: Option<[f32; 3]>,
     pub background_image: Option<String>,
     pub background_repeat: BackgroundRepeat,
@@ -338,6 +344,12 @@ impl Default for Style {
             padding_right: Length::default(),
             padding_bottom: Length::default(),
             padding_left: Length::default(),
+            width: None,
+            height: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             background: None,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
@@ -456,6 +468,45 @@ impl Style {
     pub fn letter_spacing_pt(&self) -> f32 {
         self.letter_spacing
             .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
+    }
+
+    pub fn width_pt(&self) -> Option<f32> {
+        self.resolve_dimension(
+            self.width,
+            self.min_width,
+            self.max_width,
+            self.containing_width,
+        )
+    }
+
+    pub fn height_pt(&self) -> Option<f32> {
+        self.resolve_dimension(
+            self.height,
+            self.min_height,
+            self.max_height,
+            self.containing_height,
+        )
+    }
+
+    fn resolve_dimension(
+        &self,
+        primary: Option<Length>,
+        min: Option<Length>,
+        max: Option<Length>,
+        basis: f32,
+    ) -> Option<f32> {
+        let resolve =
+            |length: Length| length.resolve_with_size(self.font_size, basis, self.px_scale);
+        let mut value = primary.map(resolve);
+        if let Some(min) = min {
+            let min = resolve(min);
+            value = Some(value.unwrap_or(min).max(min));
+        }
+        if let Some(max) = max {
+            let max = resolve(max);
+            value = Some(value.unwrap_or(max).min(max));
+        }
+        value
     }
 }
 
@@ -1737,6 +1788,30 @@ fn apply_style_declarations(
                 style.italic = lower == "italic" || lower == "oblique";
             }
             "line-height" => line_height_value = Some(value.to_string()),
+            "width" => {
+                style.width =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
+            }
+            "height" => {
+                style.height =
+                    parse_length_resolved(value, parent_size, containing_height, style.px_scale);
+            }
+            "min-width" => {
+                style.min_width =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
+            }
+            "max-width" => {
+                style.max_width =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale);
+            }
+            "min-height" => {
+                style.min_height =
+                    parse_length_resolved(value, parent_size, containing_height, style.px_scale);
+            }
+            "max-height" => {
+                style.max_height =
+                    parse_length_resolved(value, parent_size, containing_height, style.px_scale);
+            }
             "margin" => {
                 if let Some([top, right, bottom, left]) = parse_box_shorthand_resolved(
                     value,

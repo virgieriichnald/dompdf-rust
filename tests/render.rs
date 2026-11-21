@@ -933,6 +933,105 @@ fn parses_background_clip_origin_and_attachment() {
 }
 
 #[test]
+fn parses_css_box_dimensions() {
+    use html2pdf_rs::css::{Style, apply_declarations, parse_declarations};
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "width:120pt;height:60pt;min-width:80pt;max-width:200pt;min-height:40pt;max-height:100pt",
+        ),
+        12.0,
+    );
+    assert_eq!(style.width_pt(), Some(120.0));
+    assert_eq!(style.height_pt(), Some(60.0));
+
+    style.width = None;
+    assert_eq!(style.width_pt(), Some(80.0));
+    style.max_width = None;
+    assert_eq!(style.width_pt(), Some(80.0));
+    style.min_width = None;
+    assert_eq!(style.width_pt(), None);
+
+    style.containing_width = 400.0;
+    style.width = Some(html2pdf_rs::css::parse_length("50%").unwrap());
+    assert_eq!(style.width_pt(), Some(200.0));
+}
+
+#[test]
+fn css_width_constrains_block_and_wraps_text() {
+    let pdf = html2pdf_rs::render_html(
+        "<div style=\"width:120pt;background:red\">AAAA BBBB CCCC DDDD EEEE</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let rect = pdf_rects(&raw)[0];
+    let matrices = text_matrices(&raw);
+
+    assert!((rect[2] - 120.0).abs() < 0.5, "rect={rect:?}");
+    assert!(matrices.len() > 1, "matrices={matrices:?}");
+}
+
+#[test]
+fn css_max_width_clamps_background() {
+    let pdf = html2pdf_rs::render_html(
+        "<div style=\"max-width:100pt;background:red\">AAAA BBBB CCCC DDDD EEEE FFFF</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let rect = pdf_rects(&raw)[0];
+
+    assert!((rect[2] - 100.0).abs() < 0.5, "rect={rect:?}");
+}
+
+#[test]
+fn css_height_reserves_vertical_space() {
+    let render = |height: &str| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<div style=\"{height};background:red\">x</div><p>Setelah</p>"
+        ));
+        text_matrices(&String::from_utf8_lossy(&pdf))
+            .into_iter()
+            .map(|matrix| matrix.1)
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    let auto = render("");
+    let fixed = render("height:80pt");
+    assert!(fixed < auto - 60.0, "auto={auto} fixed={fixed}");
+}
+
+#[test]
+fn css_dimensions_size_absolute_overlay() {
+    let pdf = html2pdf_rs::render_html(
+        "<div style=\"position:absolute;left:10pt;top:10pt;width:100pt;height:50pt;\
+         background:red\">x</div>",
+    );
+    let rect = pdf_rects(&String::from_utf8_lossy(&pdf))[0];
+
+    assert!((rect[2] - 100.0).abs() < 0.5, "rect={rect:?}");
+    assert!((rect[3] - 50.0).abs() < 0.5, "rect={rect:?}");
+}
+
+#[test]
+fn css_dimensions_size_images() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<img src=\"data:image/png;base64,{encoded}\" style=\"width:60pt;height:30pt\">"
+    ));
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("60 0 0 30 "), "raw={raw}");
+}
+
+#[test]
 fn renders_absolute_overlay_with_z_index() {
     let pdf = html2pdf_rs::render_html(
         "<style>.box { position: absolute; left: 120pt; top: 30pt; z-index: 5 }</style>\

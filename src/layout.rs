@@ -224,6 +224,8 @@ struct BlockStyle {
     padding_right: f32,
     padding_bottom: f32,
     padding_left: f32,
+    content_width: Option<f32>,
+    cursor_start: f32,
     opacity: f32,
     border_radius: [f32; 4],
 }
@@ -248,6 +250,8 @@ impl Default for BlockStyle {
             padding_right: 0.0,
             padding_bottom: 0.0,
             padding_left: 0.0,
+            content_width: None,
+            cursor_start: 0.0,
             opacity: 1.0,
             border_radius: [0.0; 4],
         }
@@ -958,7 +962,22 @@ impl Collector {
         if line.background_width.is_none()
             && (self.block.background.is_some() || self.block.background_image.is_some())
         {
-            line.background_width = Some(self.max_width);
+            let border_extra = self
+                .block
+                .border
+                .map(|border| {
+                    (if border.left { border.width } else { 0.0 })
+                        + (if border.right { border.width } else { 0.0 })
+                })
+                .unwrap_or(0.0);
+            let width = self
+                .block
+                .content_width
+                .map(|width| {
+                    width + self.block.padding_left + self.block.padding_right + border_extra
+                })
+                .unwrap_or(self.max_width);
+            line.background_width = Some(width);
         }
         if line.links.is_empty() {
             line.links = collect_links(&line.items);
@@ -1040,6 +1059,8 @@ impl Collector {
     fn start_block(&mut self, style: &Style) {
         self.flush_line();
         self.style_stack.push(self.block.clone());
+        self.block.cursor_start = self.cursor;
+        self.block.content_width = style.width_pt();
         let mut reset_names = Vec::new();
         for (name, value) in &style.counter_reset {
             self.counters.entry(name.clone()).or_default().push(*value);
@@ -1115,6 +1136,16 @@ impl Collector {
 
     fn end_block(&mut self, style: &Style) {
         self.flush_line();
+        if let Some(target) = style.height_pt() {
+            let used = (self.cursor - self.block.cursor_start).max(0.0);
+            if target > used {
+                let extra = target - used;
+                if let Some(last) = self.pages.last_mut().and_then(|page| page.lines.last_mut()) {
+                    last.space_after = last.space_after.max(extra);
+                }
+                self.cursor += extra;
+            }
+        }
         let margin = style.margin_bottom_pt();
         if let Some(last) = self.pages.last_mut().and_then(|page| page.lines.last_mut()) {
             last.space_after = last.space_after.max(margin);
@@ -1191,7 +1222,7 @@ impl Collector {
         let top = self.cursor + self.offset_y + self.pending_before;
         let base_left = self.pending_indent + self.offset_x;
         let mut left = 0.0f32;
-        let mut right = self.max_width;
+        let mut right = self.block.content_width.unwrap_or(self.max_width);
         for float in &self.floats {
             if top < float.bottom + float.margin_bottom
                 && top + line_height > float.top - float.margin_top
@@ -2667,6 +2698,8 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         let mut width = 120.0;
         let mut height = 20.0;
         let control = form_control(&element, &style, collector, &mut width, &mut height);
+        let width = style.width_pt().unwrap_or(width);
+        let height = style.height_pt().unwrap_or(height);
         collector.form_count += 1;
         collector.push_form_item(control, width, height, &style);
         collector.link = previous_link;
@@ -2676,12 +2709,16 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if tag == "img" {
         let src = element.attr("src").unwrap_or_default();
         let alt = element.attr("alt").unwrap_or_default();
-        let width = element
-            .attr("width")
-            .and_then(|value| parse_dimension(value, collector.px_scale));
-        let height = element
-            .attr("height")
-            .and_then(|value| parse_dimension(value, collector.px_scale));
+        let width = style.width_pt().or_else(|| {
+            element
+                .attr("width")
+                .and_then(|value| parse_dimension(value, collector.px_scale))
+        });
+        let height = style.height_pt().or_else(|| {
+            element
+                .attr("height")
+                .and_then(|value| parse_dimension(value, collector.px_scale))
+        });
         collector.push_image(src, alt, width, height, &style);
         collector.link = previous_link;
         return;
@@ -2691,12 +2728,16 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         if let Some(asset) = render_svg(&element.html()) {
             collector.images.push(asset);
             let index = collector.images.len() - 1;
-            let width = element
-                .attr("width")
-                .and_then(|value| parse_dimension(value, collector.px_scale));
-            let height = element
-                .attr("height")
-                .and_then(|value| parse_dimension(value, collector.px_scale));
+            let width = style.width_pt().or_else(|| {
+                element
+                    .attr("width")
+                    .and_then(|value| parse_dimension(value, collector.px_scale))
+            });
+            let height = style.height_pt().or_else(|| {
+                element
+                    .attr("height")
+                    .and_then(|value| parse_dimension(value, collector.px_scale))
+            });
             collector.push_image_item(index, width, height, &style);
         }
         collector.link = previous_link;
@@ -2730,6 +2771,9 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     let is_block = style.display == Display::Block;
     if is_block {
         collector.start_block(&style);
+        if let Some(width) = collector.block.content_width {
+            style.containing_width = width;
+        }
     }
     let previous_struct_role = collector.struct_role;
     collector.struct_role = match heading_level(tag) {
@@ -3231,6 +3275,8 @@ fn layout_overlay<'a>(
         padding_right: style.padding_right_pt(),
         padding_bottom: style.padding_bottom_pt(),
         padding_left: style.padding_left_pt(),
+        content_width: Some(style.width_pt().unwrap_or(content_width)),
+        cursor_start: 0.0,
         opacity: style.opacity,
         border_radius: style.border_radius,
     };
@@ -3276,8 +3322,26 @@ fn layout_overlay<'a>(
         .map(|line| line.space_before + line.height + line.space_after)
         .sum::<f32>();
     let available_width = (saved_max - margin_left - margin_right).max(1.0);
-    let box_width = (text_width + padding_left + padding_right).clamp(1.0, available_width);
-    let box_height = (content_height + padding_top + padding_bottom).max(1.0);
+    let border_extra = |border: BorderSpec| {
+        (if border.left { border.width } else { 0.0 })
+            + (if border.right { border.width } else { 0.0 })
+    };
+    let border_width = style.border.map(border_extra).unwrap_or(0.0);
+    let border_height = style
+        .border
+        .map(|border| {
+            (if border.top { border.width } else { 0.0 })
+                + (if border.bottom { border.width } else { 0.0 })
+        })
+        .unwrap_or(0.0);
+    let box_width = style
+        .width_pt()
+        .map(|width| width + padding_left + padding_right + border_width)
+        .unwrap_or((text_width + padding_left + padding_right).clamp(1.0, available_width));
+    let box_height = style
+        .height_pt()
+        .map(|height| height + padding_top + padding_bottom + border_height)
+        .unwrap_or((content_height + padding_top + padding_bottom).max(1.0));
 
     let resolve = |value: Option<Length>| {
         value

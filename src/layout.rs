@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
 use crate::css::{
-    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Clear, Display, Float, FontFace,
-    Length, ListStyle, MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign,
-    VerticalAlign, WhiteSpace, parse_color, parse_font_faces, parse_length, parse_page_rules,
-    parse_styles, pseudo_style_for, px_scale, style_for,
+    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Clear, CounterStyle,
+    CounterSystem, Display, Float, FontFace, Length, ListStyle, MediaContext, PageRules, Position,
+    PseudoElement, Rule, Style, TextAlign, VerticalAlign, WhiteSpace, parse_color,
+    parse_counter_styles, parse_font_faces, parse_length, parse_page_rules, parse_styles,
+    pseudo_style_for, px_scale, style_for,
 };
 use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
@@ -78,9 +80,107 @@ pub struct ImageItem {
 }
 
 #[derive(Clone, Debug)]
+pub struct FormItem {
+    pub control: FormControl,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Debug)]
+pub enum FormControl {
+    Text {
+        name: String,
+        value: String,
+        password: bool,
+        multiline: bool,
+        max_len: Option<i32>,
+        required: bool,
+        read_only: bool,
+        js: Option<String>,
+    },
+    CheckBox {
+        name: String,
+        checked: bool,
+        required: bool,
+        js: Option<String>,
+    },
+    Radio {
+        name: String,
+        value: String,
+        checked: bool,
+        js: Option<String>,
+    },
+    Choice {
+        name: String,
+        options: Vec<String>,
+        value: Option<String>,
+        combo: bool,
+        multiple: bool,
+        js: Option<String>,
+    },
+    PushButton {
+        name: String,
+        caption: String,
+        js: Option<String>,
+    },
+}
+
+impl FormControl {
+    pub fn field_name(&self) -> &str {
+        match self {
+            Self::Text { name, .. }
+            | Self::CheckBox { name, .. }
+            | Self::Radio { name, .. }
+            | Self::Choice { name, .. }
+            | Self::PushButton { name, .. } => name,
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text {
+                value, password, ..
+            } => {
+                if *password {
+                    "*".repeat(value.chars().count())
+                } else {
+                    value.clone()
+                }
+            }
+            Self::CheckBox { checked, .. } => {
+                if *checked {
+                    "✓".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            Self::Radio { checked, .. } => {
+                if *checked {
+                    "●".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            Self::Choice { value, options, .. } => value
+                .clone()
+                .or_else(|| options.first().cloned())
+                .unwrap_or_default(),
+            Self::PushButton { caption, .. } => caption.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum InlineItem {
     Text(Run),
     Image(ImageItem),
+    Form(FormItem),
+}
+
+#[derive(Clone, Debug)]
+pub struct Script {
+    pub name: String,
+    pub code: String,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +214,8 @@ struct BlockStyle {
     background_size: BackgroundSize,
     background_position_x: f32,
     background_position_y: f32,
+    background_position_x_is_length: bool,
+    background_position_y_is_length: bool,
     border: Option<BorderSpec>,
     opacity: f32,
     border_radius: [f32; 4],
@@ -129,11 +231,25 @@ impl Default for BlockStyle {
             background_size: BackgroundSize::Auto,
             background_position_x: 0.0,
             background_position_y: 0.0,
+            background_position_x_is_length: false,
+            background_position_y_is_length: false,
             border: None,
             opacity: 1.0,
             border_radius: [0.0; 4],
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureRole {
+    Paragraph,
+    Heading1,
+    Heading2,
+    Heading3,
+    Heading4,
+    Heading5,
+    Heading6,
+    ListItem,
 }
 
 #[derive(Clone, Debug)]
@@ -153,11 +269,14 @@ pub struct Line {
     pub background_size: BackgroundSize,
     pub background_position_x: f32,
     pub background_position_y: f32,
+    pub background_position_x_is_length: bool,
+    pub background_position_y_is_length: bool,
     pub background_width: Option<f32>,
     pub border: Option<BorderSpec>,
     pub opacity: f32,
     pub border_radius: [f32; 4],
     pub links: Vec<LinkRect>,
+    pub struct_role: StructureRole,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -193,6 +312,7 @@ pub struct EmbeddedFont {
     pub bold: bool,
     pub italic: bool,
     pub data: Vec<u8>,
+    pub is_cff: bool,
     pub advance: HashMap<char, f32>,
     pub glyphs: HashMap<char, u16>,
     pub units_per_em: u16,
@@ -215,12 +335,18 @@ pub struct Document {
     pub bookmarks: Vec<Bookmark>,
     pub images: Vec<ImageAsset>,
     pub fonts: Vec<EmbeddedFont>,
+    pub counter_styles: Vec<CounterStyle>,
+    pub scripts: Vec<Script>,
+    pub lang: Option<String>,
     pub metadata: Metadata,
     pub width: f32,
     pub height: f32,
     pub margin: f32,
     pub page_text: Option<String>,
     pub page_text_location: PageTextLocation,
+    pub user_password: Option<String>,
+    pub owner_password: Option<String>,
+    pub pdf_a: bool,
     pub px_scale: f32,
 }
 
@@ -237,6 +363,8 @@ impl Document {
         let parsed = Html::parse_document(html);
         let base = resolve_base(&parsed, base);
         let metadata = parse_metadata(&parsed);
+        let lang = parse_lang(&parsed);
+        let scripts = collect_scripts(&parsed);
         let mut options = options.clone();
         let provisional_media = MediaContext {
             media_type: "print".to_string(),
@@ -267,10 +395,12 @@ impl Document {
         };
         let rules = parse_styles(&parsed, &base, &media, &options.resource);
         let font_faces = parse_font_faces(&parsed, &base, &media, &options.resource);
+        let counter_styles = parse_counter_styles(&parsed, &base, &media, &options.resource);
         let base_style = Style {
             font_family: options.default_font.clone(),
             px_scale: px_scale(options.dpi),
             containing_width: (options.width - 2.0 * options.margin).max(1.0),
+            containing_height: (options.height - 2.0 * options.margin).max(1.0),
             ..Style::default()
         };
         let geometry = PageGeometry {
@@ -285,6 +415,7 @@ impl Document {
             options.image_byte_limit,
             options.resource.clone(),
             page_rules,
+            counter_styles.clone(),
         );
         let initial_geometry = collector.geometry_for(0);
         collector.pages[0].geometry = initial_geometry;
@@ -300,12 +431,18 @@ impl Document {
             bookmarks: collector.bookmarks,
             images: collector.images,
             fonts: collector.fonts,
+            counter_styles: collector.counter_styles,
+            scripts,
+            lang,
             metadata,
             width: options.width,
             height: options.height,
             margin: options.margin,
             page_text: options.page_text.clone(),
             page_text_location: options.page_text_location,
+            user_password: options.user_password.clone(),
+            owner_password: options.owner_password.clone(),
+            pdf_a: options.pdf_a,
             px_scale: base_style.px_scale,
         }
     }
@@ -336,6 +473,217 @@ fn resolve_base(html: &Html, base: &Path) -> PathBuf {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| base.to_path_buf())
     }
+}
+
+fn collect_scripts(html: &Html) -> Vec<Script> {
+    let mut scripts = Vec::new();
+    let mut inline = 0usize;
+
+    for node in html.root_element().descendants() {
+        let Some(element) = ElementRef::wrap(node) else {
+            continue;
+        };
+        if element.value().name() == "script" {
+            let code = element.text().collect::<String>().trim().to_string();
+            if !code.is_empty() {
+                scripts.push(Script {
+                    name: format!("Script{}", scripts.len() + 1),
+                    code,
+                });
+            }
+        }
+        for (key, value) in element.value().attrs() {
+            if key.starts_with("on") && !value.trim().is_empty() {
+                inline += 1;
+                scripts.push(Script {
+                    name: format!("Inline{inline}"),
+                    code: value.to_string(),
+                });
+            }
+        }
+    }
+
+    scripts
+}
+
+fn inline_script(element: &ElementRef) -> Option<String> {
+    let handlers = element
+        .value()
+        .attrs()
+        .filter(|(key, value)| key.starts_with("on") && !value.trim().is_empty())
+        .map(|(_, value)| value.to_string())
+        .collect::<Vec<_>>();
+    (!handlers.is_empty()).then(|| handlers.join(";"))
+}
+
+fn element_text(element: &ElementRef) -> String {
+    let mut text = String::new();
+    collect_element_text(*element, &mut text);
+    normalize_title(&text)
+}
+
+fn form_control(
+    element: &ElementRef,
+    style: &Style,
+    collector: &Collector,
+    width: &mut f32,
+    height: &mut f32,
+) -> FormControl {
+    let tag = element.value().name();
+    let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+    let js = inline_script(element);
+    let name = element
+        .attr("name")
+        .or_else(|| element.attr("id"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("field{}", collector.form_count + 1));
+    let required = element.attr("required").is_some();
+    let read_only = element.attr("readonly").is_some();
+    let max_len = element
+        .attr("maxlength")
+        .and_then(|value| value.parse().ok());
+    let mut value = element.attr("value").unwrap_or_default().to_string();
+    if value.is_empty() && matches!(tag, "textarea" | "button") {
+        value = element_text(element);
+    }
+
+    match tag {
+        "textarea" => {
+            *width = element
+                .attr("cols")
+                .and_then(|value| value.parse::<f32>().ok())
+                .map(|cols| cols * style.font_size * 0.6)
+                .unwrap_or(160.0);
+            *height = element
+                .attr("rows")
+                .and_then(|value| value.parse::<f32>().ok())
+                .map(|rows| rows * style.font_size * 1.4)
+                .unwrap_or(48.0);
+            FormControl::Text {
+                name,
+                value,
+                password: false,
+                multiline: true,
+                max_len,
+                required,
+                read_only,
+                js,
+            }
+        }
+        "select" => {
+            let mut options = Vec::new();
+            let mut selected = None;
+            for node in element.descendants() {
+                let Some(option) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                if option.value().name() != "option" {
+                    continue;
+                }
+                let label = option.text().collect::<String>().trim().to_string();
+                if label.is_empty() {
+                    continue;
+                }
+                if option.attr("selected").is_some() && selected.is_none() {
+                    selected = Some(label.clone());
+                }
+                options.push(label);
+            }
+            *width = options
+                .iter()
+                .map(|label| label.chars().count())
+                .max()
+                .map(|len| (len.max(8) as f32) * style.font_size * 0.6 + 18.0)
+                .unwrap_or(120.0)
+                .min(240.0);
+            *height = 20.0;
+            FormControl::Choice {
+                name,
+                options,
+                value: selected.or_else(|| (!value.is_empty()).then_some(value)),
+                combo: element.attr("multiple").is_none(),
+                multiple: element.attr("multiple").is_some(),
+                js,
+            }
+        }
+        "button" => {
+            let caption = if value.is_empty() {
+                "Button".to_string()
+            } else {
+                value
+            };
+            *width = (caption.chars().count().max(6) as f32) * style.font_size * 0.6 + 16.0;
+            *height = 20.0;
+            FormControl::PushButton { name, caption, js }
+        }
+        _ => match input_type.as_str() {
+            "checkbox" => {
+                *width = 14.0;
+                *height = 14.0;
+                FormControl::CheckBox {
+                    name,
+                    checked: element.attr("checked").is_some(),
+                    required,
+                    js,
+                }
+            }
+            "radio" => {
+                *width = 14.0;
+                *height = 14.0;
+                FormControl::Radio {
+                    name,
+                    value,
+                    checked: element.attr("checked").is_some(),
+                    js,
+                }
+            }
+            "submit" | "button" | "reset" => {
+                let caption = if value.is_empty() {
+                    match input_type.as_str() {
+                        "submit" => "Submit",
+                        "reset" => "Reset",
+                        _ => "Button",
+                    }
+                    .to_string()
+                } else {
+                    value
+                };
+                *width = (caption.chars().count().max(6) as f32) * style.font_size * 0.6 + 16.0;
+                *height = 20.0;
+                FormControl::PushButton { name, caption, js }
+            }
+            _ => {
+                if value.is_empty() {
+                    value = element_text(element);
+                }
+                *width = element
+                    .attr("size")
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .map(|size| size * style.font_size * 0.6)
+                    .unwrap_or(120.0);
+                *height = if input_type == "hidden" { 0.0 } else { 20.0 };
+                FormControl::Text {
+                    name,
+                    value,
+                    password: input_type == "password",
+                    multiline: false,
+                    max_len,
+                    required,
+                    read_only,
+                    js,
+                }
+            }
+        },
+    }
+}
+
+fn parse_lang(html: &Html) -> Option<String> {
+    html.root_element()
+        .attr("lang")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_metadata(html: &Html) -> Metadata {
@@ -389,6 +737,15 @@ fn resolve_uri(href: &str, base: &Path) -> String {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct FloatRect {
+    side: Float,
+    left: f32,
+    width: f32,
+    top: f32,
+    bottom: f32,
+}
+
+#[derive(Clone, Debug)]
 struct ListState {
     style: ListStyle,
     counter: i64,
@@ -412,6 +769,9 @@ struct Collector {
     offset_stack: Vec<(f32, f32)>,
     float_left_bottom: f32,
     float_right_bottom: f32,
+    floats: Vec<FloatRect>,
+    float_indent: f32,
+    line_max_width: f32,
     align: TextAlign,
     max_width: f32,
     page_height: f32,
@@ -421,10 +781,13 @@ struct Collector {
     image_cache: HashMap<String, Option<usize>>,
     fonts: Vec<EmbeddedFont>,
     font_cache: HashMap<String, Option<usize>>,
+    counter_styles: Vec<CounterStyle>,
     block: BlockStyle,
     style_stack: Vec<BlockStyle>,
     link: Option<String>,
     lists: Vec<ListState>,
+    struct_role: StructureRole,
+    form_count: usize,
     counters: HashMap<String, Vec<i32>>,
     reset_stack: Vec<Vec<String>>,
     px_scale: f32,
@@ -440,6 +803,7 @@ impl Collector {
         image_byte_limit: Option<usize>,
         policy: ResourcePolicy,
         page_rules: PageRules,
+        counter_styles: Vec<CounterStyle>,
     ) -> Self {
         let content_width = geometry.width - 2.0 * geometry.margin;
         let content_height = geometry.height - 2.0 * geometry.margin;
@@ -464,6 +828,9 @@ impl Collector {
             offset_stack: Vec::new(),
             float_left_bottom: 0.0,
             float_right_bottom: 0.0,
+            floats: Vec::new(),
+            float_indent: 0.0,
+            line_max_width: content_width,
             align: TextAlign::Left,
             max_width: content_width,
             page_height: content_height,
@@ -473,10 +840,13 @@ impl Collector {
             image_cache: HashMap::new(),
             fonts: Vec::new(),
             font_cache: HashMap::new(),
+            counter_styles,
             block: BlockStyle::default(),
             style_stack: Vec::new(),
             link: None,
             lists: Vec::new(),
+            struct_role: StructureRole::Paragraph,
+            form_count: 0,
             counters: HashMap::new(),
             reset_stack: Vec::new(),
             px_scale,
@@ -497,6 +867,9 @@ impl Collector {
     fn apply_geometry(&mut self, geometry: PageGeometry) {
         self.max_width = geometry.width - 2.0 * geometry.margin;
         self.page_height = geometry.height - 2.0 * geometry.margin;
+        if self.current.is_empty() {
+            self.line_max_width = self.max_width;
+        }
     }
 
     fn new_page(&mut self) {
@@ -511,6 +884,8 @@ impl Collector {
         self.cursor = 0.0;
         self.float_left_bottom = 0.0;
         self.float_right_bottom = 0.0;
+        self.floats.clear();
+        self.line_max_width = self.max_width;
     }
 
     fn page_is_empty(&self) -> bool {
@@ -528,6 +903,8 @@ impl Collector {
             line.background_size = self.block.background_size;
             line.background_position_x = self.block.background_position_x;
             line.background_position_y = self.block.background_position_y;
+            line.background_position_x_is_length = self.block.background_position_x_is_length;
+            line.background_position_y_is_length = self.block.background_position_y_is_length;
         }
         if line.border.is_none() {
             line.border = self.block.border;
@@ -556,8 +933,10 @@ impl Collector {
 
         self.cursor += line.space_before;
         line.top = self.cursor + self.offset_y;
-        line.left = self.pending_indent + self.offset_x;
+        line.left = self.pending_indent + self.offset_x + self.float_indent;
         self.pending_indent = 0.0;
+        self.float_indent = 0.0;
+        self.line_max_width = self.max_width;
         self.cursor += line.height + line.space_after;
         self.push_line(line);
     }
@@ -593,11 +972,14 @@ impl Collector {
             background_size: BackgroundSize::Auto,
             background_position_x: 0.0,
             background_position_y: 0.0,
+            background_position_x_is_length: false,
+            background_position_y_is_length: false,
             background_width: None,
             border: None,
             opacity: 1.0,
             border_radius: [0.0; 4],
             links: Vec::new(),
+            struct_role: self.struct_role,
         };
 
         self.width = 0.0;
@@ -613,6 +995,17 @@ impl Collector {
         if let Some((name, value)) = &style.counter_reset {
             self.counters.entry(name.clone()).or_default().push(*value);
             reset_names.push(name.clone());
+        }
+        if let Some((name, value)) = &style.counter_set {
+            let values = self.counters.entry(name.clone()).or_default();
+            if let Some(last) = values.last_mut() {
+                *last = *value;
+            } else {
+                values.push(*value);
+            }
+            if !reset_names.contains(name) {
+                reset_names.push(name.clone());
+            }
         }
         increment_counter(&mut self.counters, style);
         self.reset_stack.push(reset_names);
@@ -648,6 +1041,8 @@ impl Collector {
         self.block.background_size = style.background_size;
         self.block.background_position_x = style.background_position_x;
         self.block.background_position_y = style.background_position_y;
+        self.block.background_position_x_is_length = style.background_position_x_is_length;
+        self.block.background_position_y_is_length = style.background_position_y_is_length;
         if style.border.is_some() {
             self.block.border = style.border;
         }
@@ -722,6 +1117,31 @@ impl Collector {
             + spacing * text.chars().count() as f32
     }
 
+    fn prepare_line(&mut self, line_height: f32) {
+        if !self.current.is_empty() {
+            return;
+        }
+        let top = self.cursor + self.offset_y + self.pending_before;
+        let base_left = self.pending_indent + self.offset_x;
+        let mut left = 0.0f32;
+        let mut right = self.max_width;
+        for float in &self.floats {
+            if top < float.bottom && top + line_height > float.top {
+                match float.side {
+                    Float::Left => {
+                        left = left.max(float.left + float.width - base_left);
+                    }
+                    Float::Right => {
+                        right = right.min(float.left - base_left);
+                    }
+                    Float::None => {}
+                }
+            }
+        }
+        self.float_indent = left.max(0.0);
+        self.line_max_width = (right - left).max(self.max_width * 0.2).max(1.0);
+    }
+
     fn push_text(&mut self, text: &str, style: &Style) {
         if style.white_space == WhiteSpace::Pre {
             self.push_text_pre(text, style);
@@ -731,7 +1151,9 @@ impl Collector {
         let space_width = self.text_width(" ", style);
         let wrap = style.white_space != WhiteSpace::Nowrap;
 
+        let line_height = style.font_size * style.line_height;
         for word in text.split_whitespace() {
+            self.prepare_line(line_height);
             let word_width = self.text_width(word, style);
             let extra = if self.current.is_empty() {
                 0.0
@@ -739,9 +1161,12 @@ impl Collector {
                 space_width
             };
 
-            if wrap && !self.current.is_empty() && self.width + extra + word_width > self.max_width
+            if wrap
+                && !self.current.is_empty()
+                && self.width + extra + word_width > self.line_max_width
             {
                 self.flush_line();
+                self.prepare_line(line_height);
             }
 
             if !self.current.is_empty() {
@@ -863,8 +1288,11 @@ impl Collector {
             (None, None) => (natural_width, natural_height),
         };
 
-        if !self.current.is_empty() && self.width + width > self.max_width {
+        let line_height = height.max(style.font_size * style.line_height);
+        self.prepare_line(line_height);
+        if !self.current.is_empty() && self.width + width > self.line_max_width {
             self.flush_line();
+            self.prepare_line(line_height);
         }
 
         self.current.push(InlineItem::Image(ImageItem {
@@ -872,6 +1300,25 @@ impl Collector {
             width,
             height,
             link: self.link.clone(),
+        }));
+        self.width += width;
+        self.height = self
+            .height
+            .max(height)
+            .max(style.font_size * style.line_height);
+    }
+
+    fn push_form_item(&mut self, control: FormControl, width: f32, height: f32, style: &Style) {
+        let line_height = height.max(style.font_size * style.line_height);
+        self.prepare_line(line_height);
+        if !self.current.is_empty() && self.width + width > self.line_max_width {
+            self.flush_line();
+            self.prepare_line(line_height);
+        }
+        self.current.push(InlineItem::Form(FormItem {
+            control,
+            width,
+            height,
         }));
         self.width += width;
         self.height = self
@@ -926,8 +1373,732 @@ fn render_svg(svg: &str) -> Option<ImageAsset> {
     load_image_bytes(&pixmap.encode_png().ok()?)
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn push_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn decode_font_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    match bytes.get(0..4)? {
+        b"wOFF" => decode_woff1(bytes),
+        b"wOF2" => decode_woff2(bytes),
+        _ => Some(bytes.to_vec()),
+    }
+}
+
+fn decode_woff1(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 44 {
+        return None;
+    }
+    let flavor = read_u32(bytes, 4)?;
+    let num_tables = read_u16(bytes, 12)? as usize;
+    let total_sfnt_size = read_u32(bytes, 16)? as usize;
+    let mut records = Vec::with_capacity(num_tables);
+
+    for index in 0..num_tables {
+        let base = 44 + index * 20;
+        let tag = read_u32(bytes, base)?;
+        let offset = read_u32(bytes, base + 4)? as usize;
+        let compressed = read_u32(bytes, base + 8)? as usize;
+        let original = read_u32(bytes, base + 12)? as usize;
+        let checksum = read_u32(bytes, base + 16)?;
+        let source = bytes.get(offset..offset.checked_add(compressed)?)?;
+        let data = if compressed < original {
+            let mut decoder = flate2::read::ZlibDecoder::new(source);
+            let mut data = Vec::with_capacity(original);
+            decoder.read_to_end(&mut data).ok()?;
+            data
+        } else {
+            source.to_vec()
+        };
+        if data.len() != original {
+            return None;
+        }
+        records.push((tag, checksum, data));
+    }
+    records.sort_by_key(|record| record.0);
+
+    let mut search_range = 16usize;
+    let mut entry_selector = 0u16;
+    while search_range * 2 <= num_tables * 16 {
+        search_range *= 2;
+        entry_selector += 1;
+    }
+    let range_shift = (num_tables * 16).saturating_sub(search_range);
+    let mut output = Vec::with_capacity(total_sfnt_size.max(12 + num_tables * 16));
+    push_u32(&mut output, flavor);
+    push_u16(&mut output, num_tables as u16);
+    push_u16(&mut output, search_range as u16);
+    push_u16(&mut output, entry_selector);
+    push_u16(&mut output, range_shift as u16);
+
+    let mut offset = 12 + num_tables * 16;
+    for (tag, checksum, data) in &records {
+        push_u32(&mut output, *tag);
+        push_u32(&mut output, *checksum);
+        push_u32(&mut output, offset as u32);
+        push_u32(&mut output, data.len() as u32);
+        offset += data.len() + (4 - data.len() % 4) % 4;
+    }
+    for (_, _, data) in &records {
+        output.extend_from_slice(data);
+        let padding = (4 - data.len() % 4) % 4;
+        output.resize(output.len() + padding, 0);
+    }
+
+    Some(output)
+}
+
+struct Woff2Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Woff2Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn rest(&self) -> &'a [u8] {
+        self.data.get(self.pos..).unwrap_or_default()
+    }
+
+    fn skip(&mut self, count: usize) -> Option<()> {
+        self.pos = self.pos.checked_add(count)?;
+        if self.pos <= self.data.len() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let slice = self.data.get(self.pos..self.pos.checked_add(count)?)?;
+        self.pos += count;
+        Some(slice)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let value = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(value)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let value = read_u16(self.data, self.pos)?;
+        self.pos += 2;
+        Some(value)
+    }
+
+    fn i16(&mut self) -> Option<i16> {
+        Some(self.u16()? as i16)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let value = read_u32(self.data, self.pos)?;
+        self.pos += 4;
+        Some(value)
+    }
+
+    fn u255(&mut self) -> Option<u16> {
+        match self.u8()? {
+            253 => Some(((self.u8()? as u16) << 8) | self.u8()? as u16),
+            254 => self.u8().map(|value| value as u16 + 506),
+            255 => self.u8().map(|value| value as u16 + 253),
+            value => Some(value as u16),
+        }
+    }
+}
+
+type Woff2GlyfResult = (Vec<u8>, Vec<u8>, Vec<i16>, usize);
+
+#[derive(Clone)]
+struct Woff2Table {
+    tag: u32,
+    encoded_len: u32,
+    transform: u8,
+    data: Option<Vec<u8>>,
+}
+
+fn decode_woff2(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 48 {
+        return None;
+    }
+    let flavor = read_u32(bytes, 4)?;
+    let num_tables = read_u16(bytes, 12)? as usize;
+    let total_compressed = read_u32(bytes, 20)? as usize;
+    let mut dir_pos = 48usize;
+    let mut tables = Vec::with_capacity(num_tables);
+
+    for _ in 0..num_tables {
+        let flags = *bytes.get(dir_pos)?;
+        dir_pos += 1;
+        let tag = if flags & 0x3f == 63 {
+            let tag = read_u32(bytes, dir_pos)?;
+            dir_pos += 4;
+            tag
+        } else {
+            woff2_known_tag((flags & 0x3f) as usize)?
+        };
+        let transform = flags >> 6;
+        let valid = match tag {
+            tag if tag == tag::GLYF || tag == tag::LOCA => transform == 0 || transform == 3,
+            tag if tag == tag::HMTX => transform == 0 || transform == 1,
+            _ => transform == 0,
+        };
+        if !valid {
+            return None;
+        }
+        let orig_len = read_woff2_base128(bytes, &mut dir_pos)?;
+        let non_null = if tag == tag::GLYF || tag == tag::LOCA {
+            transform != 3
+        } else {
+            transform != 0
+        };
+        let transform_len = if non_null {
+            read_woff2_base128(bytes, &mut dir_pos)?
+        } else {
+            0
+        };
+        if tag == tag::LOCA && transform == 0 && transform_len != 0 {
+            return None;
+        }
+        let encoded_len = if non_null { transform_len } else { orig_len };
+        tables.push(Woff2Table {
+            tag,
+            encoded_len,
+            transform,
+            data: None,
+        });
+    }
+
+    let compressed = bytes.get(dir_pos..dir_pos.checked_add(total_compressed)?)?;
+    let mut decompressed = Vec::new();
+    brotli::Decompressor::new(compressed, 4096)
+        .read_to_end(&mut decompressed)
+        .ok()?;
+    let mut stream = Woff2Reader::new(&decompressed);
+    let mut glyf_result: Option<Woff2GlyfResult> = None;
+
+    for table in &mut tables {
+        if table.tag == tag::LOCA && table.transform == 0 {
+            continue;
+        }
+        let encoded = stream.take(table.encoded_len as usize)?;
+        if table.tag == tag::GLYF && table.transform == 0 {
+            glyf_result = Some(inverse_woff2_glyf(encoded)?);
+        } else {
+            table.data = Some(encoded.to_vec());
+        }
+    }
+
+    if let Some((glyf, loca, xmins, num_glyphs)) = glyf_result {
+        for table in &mut tables {
+            if table.tag == tag::GLYF {
+                table.data = Some(glyf.clone());
+            } else if table.tag == tag::LOCA {
+                table.data = Some(loca.clone());
+            }
+        }
+        let maxp = tables
+            .iter()
+            .find(|table| table.tag == tag::MAXP)
+            .and_then(|table| table.data.as_deref())
+            .and_then(|data| read_u16(data, 4))
+            .unwrap_or(num_glyphs as u16) as usize;
+        let hhea = tables
+            .iter()
+            .find(|table| table.tag == tag::HHEA)
+            .and_then(|table| table.data.as_deref())
+            .and_then(|data| read_u16(data, 34))
+            .unwrap_or(maxp as u16) as usize;
+        for table in &mut tables {
+            if table.tag == tag::HMTX && table.transform == 1 {
+                let encoded = table.data.take()?;
+                table.data = Some(inverse_woff2_hmtx(&encoded, maxp, hhea, &xmins)?);
+            }
+        }
+    }
+
+    let output_tables = tables
+        .into_iter()
+        .filter_map(|table| table.data.map(|data| (table.tag, data)))
+        .collect::<Vec<_>>();
+    build_woff2_sfnt(flavor, output_tables)
+}
+
+fn inverse_woff2_glyf(data: &[u8]) -> Option<Woff2GlyfResult> {
+    let mut reader = Woff2Reader::new(data);
+    reader.u16()?;
+    let option_flags = reader.u16()?;
+    let num_glyphs = reader.u16()? as usize;
+    let index_format = reader.u16()?;
+    let sizes = [
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+        reader.u32()? as usize,
+    ];
+    let contours = reader.take(sizes[0])?;
+    let points = reader.take(sizes[1])?;
+    let mut points_reader = Woff2Reader::new(points);
+    let flags = reader.take(sizes[2])?;
+    let glyphs = reader.take(sizes[3])?;
+    let mut glyph_reader = Woff2Reader::new(glyphs);
+    let composites = reader.take(sizes[4])?;
+    let mut composite_reader = Woff2Reader::new(composites);
+    let bbox_data = reader.take(sizes[5])?;
+    let bitmap_len = num_glyphs.div_ceil(32) * 4;
+    let bbox_bitmap = bbox_data.get(..bitmap_len)?;
+    let mut bbox_reader = Woff2Reader::new(bbox_data.get(bitmap_len..)?);
+    let instructions = reader.take(sizes[6])?;
+    let overlap = if option_flags & 1 != 0 {
+        reader.take(num_glyphs.div_ceil(8))?
+    } else {
+        &[]
+    };
+
+    let mut glyf = Vec::new();
+    let mut offsets = Vec::with_capacity(num_glyphs + 1);
+    let mut xmins = vec![0i16; num_glyphs];
+    let mut flags_pos = 0usize;
+    let mut instruction_pos = 0usize;
+    let mut contour_pos = 0usize;
+
+    for (glyph, xmin) in xmins.iter_mut().enumerate() {
+        offsets.push(glyf.len() as u32);
+        let mut contour_reader = Woff2Reader::new(contours.get(contour_pos..)?);
+        let n_contours = contour_reader.i16()?;
+        contour_pos += 2;
+        let explicit_bbox = bbox_bitmap
+            .get(glyph >> 3)
+            .is_some_and(|byte| byte & (0x80 >> (glyph & 7)) != 0);
+        let bbox = if explicit_bbox {
+            [
+                bbox_reader.i16()?,
+                bbox_reader.i16()?,
+                bbox_reader.i16()?,
+                bbox_reader.i16()?,
+            ]
+        } else {
+            [0, 0, 0, 0]
+        };
+
+        if n_contours == 0 {
+            if explicit_bbox {
+                return None;
+            }
+        } else if n_contours > 0 {
+            let n_contours = n_contours as usize;
+            let mut end_points = Vec::with_capacity(n_contours);
+            let mut point_count = 0usize;
+            for _ in 0..n_contours {
+                point_count = point_count.checked_add(points_reader.u255()? as usize)?;
+                end_points.push((point_count - 1) as u16);
+            }
+            let point_flags = flags.get(flags_pos..flags_pos.checked_add(point_count)?)?;
+            flags_pos += point_count;
+            let mut x = 0i32;
+            let mut y = 0i32;
+            let mut positions = Vec::with_capacity(point_count);
+            let mut output_flags = Vec::with_capacity(point_count);
+            let mut x_deltas = Vec::with_capacity(point_count);
+            let mut y_deltas = Vec::with_capacity(point_count);
+            for &point_flag in point_flags {
+                let (dx, dy, consumed) =
+                    decode_woff2_triplet(point_flag & 0x7f, glyph_reader.rest())?;
+                glyph_reader.skip(consumed)?;
+                x += dx;
+                y += dy;
+                positions.push((x, y));
+                x_deltas.push(dx as i16);
+                y_deltas.push(dy as i16);
+                output_flags.push(if point_flag & 0x80 == 0 { 1 } else { 0 });
+            }
+            let instruction_length = glyph_reader.u255()? as usize;
+            let instructions = instructions
+                .get(instruction_pos..instruction_pos.checked_add(instruction_length)?)?;
+            instruction_pos += instruction_length;
+            let bbox = if explicit_bbox {
+                bbox
+            } else {
+                let x_min = positions.iter().map(|point| point.0).min().unwrap_or(0);
+                let x_max = positions.iter().map(|point| point.0).max().unwrap_or(0);
+                let y_min = positions.iter().map(|point| point.1).min().unwrap_or(0);
+                let y_max = positions.iter().map(|point| point.1).max().unwrap_or(0);
+                [x_min as i16, y_min as i16, x_max as i16, y_max as i16]
+            };
+            if overlap
+                .get(glyph >> 3)
+                .is_some_and(|byte| byte & (0x80 >> (glyph & 7)) != 0)
+                && !output_flags.is_empty()
+            {
+                output_flags[0] |= 0x40;
+            }
+            push_u16(&mut glyf, n_contours as u16);
+            for value in bbox {
+                push_i16(&mut glyf, value);
+            }
+            for end in end_points {
+                push_u16(&mut glyf, end);
+            }
+            push_u16(&mut glyf, instruction_length as u16);
+            glyf.extend_from_slice(instructions);
+            glyf.extend_from_slice(&output_flags);
+            for delta in x_deltas {
+                push_i16(&mut glyf, delta);
+            }
+            for delta in y_deltas {
+                push_i16(&mut glyf, delta);
+            }
+            *xmin = bbox[0];
+        } else if n_contours == -1 {
+            if !explicit_bbox {
+                return None;
+            }
+            let component_start = composite_reader.pos;
+            let mut have_instructions = false;
+            loop {
+                let flags = composite_reader.u16()?;
+                composite_reader.u16()?;
+                let argument_bytes = if flags & 1 != 0 { 4 } else { 2 };
+                composite_reader.skip(argument_bytes)?;
+                if flags & 8 != 0 {
+                    composite_reader.skip(2)?;
+                } else if flags & 0x40 != 0 {
+                    composite_reader.skip(4)?;
+                } else if flags & 0x80 != 0 {
+                    composite_reader.skip(8)?;
+                }
+                have_instructions |= flags & 0x100 != 0;
+                if flags & 0x20 == 0 {
+                    break;
+                }
+            }
+            let component = composites.get(component_start..composite_reader.pos)?;
+            let instruction_length = if have_instructions {
+                glyph_reader.u255()? as usize
+            } else {
+                0
+            };
+            let instructions = instructions
+                .get(instruction_pos..instruction_pos.checked_add(instruction_length)?)?;
+            instruction_pos += instruction_length;
+            push_u16(&mut glyf, 0xffff);
+            for value in bbox {
+                push_i16(&mut glyf, value);
+            }
+            glyf.extend_from_slice(component);
+            if have_instructions {
+                push_u16(&mut glyf, instruction_length as u16);
+                glyf.extend_from_slice(instructions);
+            }
+            *xmin = bbox[0];
+        } else {
+            return None;
+        }
+
+        while glyf.len() % 4 != 0 {
+            glyf.push(0);
+        }
+    }
+    offsets.push(glyf.len() as u32);
+
+    let loca = if index_format == 0 {
+        let mut loca = Vec::with_capacity(offsets.len() * 2);
+        for offset in offsets {
+            push_u16(&mut loca, (offset / 2) as u16);
+        }
+        loca
+    } else {
+        let mut loca = Vec::with_capacity(offsets.len() * 4);
+        for offset in offsets {
+            push_u32(&mut loca, offset);
+        }
+        loca
+    };
+    Some((glyf, loca, xmins, num_glyphs))
+}
+
+fn decode_woff2_triplet(index: u8, data: &[u8]) -> Option<(i32, i32, usize)> {
+    let index = index as usize;
+    let (x, y, consumed) = match index {
+        0..=9 => (0usize, 256 * (index / 2) + *data.first()? as usize, 1),
+        10..=19 => (
+            256 * ((index - 10) / 2) + *data.first()? as usize,
+            0usize,
+            1,
+        ),
+        20..=83 => {
+            let byte = *data.first()?;
+            let group = (index - 20) / 16;
+            let sub = (index - 20) % 16;
+            (
+                1 + 16 * group + (byte >> 4) as usize,
+                1 + 16 * (sub / 4) + (byte & 0x0f) as usize,
+                1,
+            )
+        }
+        84..=119 => {
+            let group = (index - 84) / 12;
+            let sub = (index - 84) % 12;
+            (
+                1 + 256 * group + *data.first()? as usize,
+                1 + 256 * (sub / 4) + *data.get(1)? as usize,
+                2,
+            )
+        }
+        120..=123 => (
+            ((*data.first()? as usize) << 4) | (*data.get(1)? as usize >> 4),
+            ((*data.get(1)? as usize & 0x0f) << 8) | *data.get(2)? as usize,
+            3,
+        ),
+        124..=127 => (
+            ((*data.first()? as usize) << 8) | *data.get(1)? as usize,
+            ((*data.get(2)? as usize) << 8) | *data.get(3)? as usize,
+            4,
+        ),
+        _ => return None,
+    };
+    let x_sign = if index & 1 != 0 { 1 } else { -1 };
+    let y_sign = if index & 2 != 0 { 1 } else { -1 };
+    Some((x as i32 * x_sign, y as i32 * y_sign, consumed))
+}
+
+fn inverse_woff2_hmtx(
+    data: &[u8],
+    num_glyphs: usize,
+    num_hmetrics: usize,
+    xmins: &[i16],
+) -> Option<Vec<u8>> {
+    let mut reader = Woff2Reader::new(data);
+    let flags = reader.u8()?;
+    if flags & 0xfc != 0 || flags & 0x03 == 0 || num_hmetrics == 0 {
+        return None;
+    }
+    let advances = (0..num_hmetrics)
+        .map(|_| reader.u16())
+        .collect::<Option<Vec<_>>>()?;
+    let mut bearings = vec![0i16; num_glyphs];
+    if flags & 1 == 0 {
+        for bearing in bearings.iter_mut().take(num_hmetrics) {
+            *bearing = reader.i16()?;
+        }
+    } else {
+        for (index, bearing) in bearings.iter_mut().take(num_hmetrics).enumerate() {
+            *bearing = xmins.get(index).copied().unwrap_or(0);
+        }
+    }
+    if flags & 2 == 0 {
+        for bearing in bearings.iter_mut().skip(num_hmetrics) {
+            *bearing = reader.i16()?;
+        }
+    } else {
+        for (index, bearing) in bearings.iter_mut().enumerate().skip(num_hmetrics) {
+            *bearing = xmins.get(index).copied().unwrap_or(0);
+        }
+    }
+    let mut output = Vec::with_capacity(num_glyphs * 2 + num_hmetrics * 2);
+    for (index, advance) in advances.iter().enumerate() {
+        push_u16(&mut output, *advance);
+        push_i16(&mut output, bearings[index]);
+    }
+    for bearing in bearings.iter().skip(num_hmetrics) {
+        push_i16(&mut output, *bearing);
+    }
+    Some(output)
+}
+
+fn read_woff2_base128(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut value = 0u32;
+    for index in 0..5 {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        if index == 0 && byte == 0x80 {
+            return None;
+        }
+        if value & 0xfe00_0000 != 0 {
+            return None;
+        }
+        value = (value << 7) | (byte & 0x7f) as u32;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn woff2_known_tag(index: usize) -> Option<u32> {
+    let tag = match index {
+        0 => b"cmap",
+        1 => b"head",
+        2 => b"hhea",
+        3 => b"hmtx",
+        4 => b"maxp",
+        5 => b"name",
+        6 => b"OS/2",
+        7 => b"post",
+        8 => b"cvt ",
+        9 => b"fpgm",
+        10 => b"glyf",
+        11 => b"loca",
+        12 => b"prep",
+        13 => b"CFF ",
+        14 => b"VORG",
+        15 => b"EBDT",
+        16 => b"EBLC",
+        17 => b"gasp",
+        18 => b"hdmx",
+        19 => b"kern",
+        20 => b"LTSH",
+        21 => b"PCLT",
+        22 => b"VDMX",
+        23 => b"vhea",
+        24 => b"vmtx",
+        25 => b"BASE",
+        26 => b"GDEF",
+        27 => b"GPOS",
+        28 => b"GSUB",
+        29 => b"EBSC",
+        30 => b"JSTF",
+        31 => b"MATH",
+        32 => b"CBDT",
+        33 => b"CBLC",
+        34 => b"COLR",
+        35 => b"CPAL",
+        36 => b"SVG ",
+        37 => b"sbix",
+        38 => b"acnt",
+        39 => b"avar",
+        40 => b"bdat",
+        41 => b"bloc",
+        42 => b"bsln",
+        43 => b"cvar",
+        44 => b"fdsc",
+        45 => b"feat",
+        46 => b"fmtx",
+        47 => b"fvar",
+        48 => b"gvar",
+        49 => b"hsty",
+        50 => b"just",
+        51 => b"lcar",
+        52 => b"mort",
+        53 => b"morx",
+        54 => b"opbd",
+        55 => b"prop",
+        56 => b"trak",
+        57 => b"Zapf",
+        58 => b"Silf",
+        59 => b"Glat",
+        60 => b"Gloc",
+        61 => b"Feat",
+        62 => b"Sill",
+        _ => return None,
+    };
+    Some(u32::from_be_bytes(*tag))
+}
+
+fn build_woff2_sfnt(flavor: u32, mut tables: Vec<(u32, Vec<u8>)>) -> Option<Vec<u8>> {
+    tables.sort_by_key(|table| table.0);
+    tables.dedup_by_key(|table| table.0);
+    let num_tables = tables.len();
+    let mut search_range = 16usize;
+    let mut entry_selector = 0u16;
+    while search_range * 2 <= num_tables * 16 {
+        search_range *= 2;
+        entry_selector += 1;
+    }
+    let range_shift = (num_tables * 16).saturating_sub(search_range);
+    let mut prepared = Vec::with_capacity(num_tables);
+    for (tag, data) in tables {
+        let mut data = data;
+        if tag == tag::HEAD && data.len() >= 12 {
+            data[8..12].copy_from_slice(&0u32.to_be_bytes());
+        }
+        prepared.push((tag, data));
+    }
+    let mut offset = 12 + num_tables * 16;
+    let mut directory = Vec::with_capacity(num_tables * 16);
+    for (tag, data) in &prepared {
+        push_u32(&mut directory, *tag);
+        push_u32(&mut directory, sfnt_checksum(data));
+        push_u32(&mut directory, offset as u32);
+        push_u32(&mut directory, data.len() as u32);
+        offset += data.len() + (4 - data.len() % 4) % 4;
+    }
+    let mut output = Vec::with_capacity(offset);
+    push_u32(&mut output, flavor);
+    push_u16(&mut output, num_tables as u16);
+    push_u16(&mut output, search_range as u16);
+    push_u16(&mut output, entry_selector);
+    push_u16(&mut output, range_shift as u16);
+    output.extend_from_slice(&directory);
+    let mut head_offset = None;
+    let mut current_offset = 12 + num_tables * 16;
+    for (tag, data) in &prepared {
+        if *tag == tag::HEAD {
+            head_offset = Some(current_offset + 8);
+        }
+        output.extend_from_slice(data);
+        let padding = (4 - data.len() % 4) % 4;
+        output.resize(output.len() + padding, 0);
+        current_offset += data.len() + padding;
+    }
+    if let Some(head_offset) = head_offset {
+        let adjustment = 0xb1b0_afbau32.wrapping_sub(sfnt_checksum(&output));
+        output[head_offset..head_offset + 4].copy_from_slice(&adjustment.to_be_bytes());
+    }
+    Some(output)
+}
+
+fn sfnt_checksum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    for chunk in data.as_chunks::<4>().0 {
+        sum = sum.wrapping_add(u32::from_be_bytes(*chunk));
+    }
+    let remainder = &data[data.len() / 4 * 4..];
+    if !remainder.is_empty() {
+        let mut padded = [0u8; 4];
+        padded[..remainder.len()].copy_from_slice(remainder);
+        sum = sum.wrapping_add(u32::from_be_bytes(padded));
+    }
+    sum
+}
+
+fn push_i16(output: &mut Vec<u8>, value: i16) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+mod tag {
+    pub const GLYF: u32 = u32::from_be_bytes(*b"glyf");
+    pub const LOCA: u32 = u32::from_be_bytes(*b"loca");
+    pub const HMTX: u32 = u32::from_be_bytes(*b"hmtx");
+    pub const HHEA: u32 = u32::from_be_bytes(*b"hhea");
+    pub const MAXP: u32 = u32::from_be_bytes(*b"maxp");
+    pub const HEAD: u32 = u32::from_be_bytes(*b"head");
+}
+
 fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<EmbeddedFont> {
-    let face = Face::parse(bytes, 0).ok()?;
+    let font_bytes = decode_font_bytes(bytes)?;
+    let face = Face::parse(&font_bytes, 0).ok()?;
     let units_per_em = face.units_per_em();
     let mut advance = HashMap::new();
     let mut glyphs = HashMap::new();
@@ -944,16 +2115,20 @@ fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<Emb
         glyphs.insert(ch, glyph.0);
     }
 
+    let is_cff = face.tables().cff.is_some() || face.tables().cff2.is_some();
+    let ascent = face.ascender() as f32 / units_per_em as f32;
+    let descent = face.descender() as f32 / units_per_em as f32;
     Some(EmbeddedFont {
         family: family.to_string(),
         bold,
         italic,
-        data: bytes.to_vec(),
+        data: font_bytes,
+        is_cff,
         advance,
         glyphs,
         units_per_em,
-        ascent: face.ascender() as f32 / units_per_em as f32,
-        descent: face.descender() as f32 / units_per_em as f32,
+        ascent,
+        descent,
     })
 }
 
@@ -966,6 +2141,7 @@ fn collect_links(items: &[InlineItem]) -> Vec<LinkRect> {
         let (width, link) = match item {
             InlineItem::Text(run) => (run.width, run.link.as_ref()),
             InlineItem::Image(image) => (image.width, image.link.as_ref()),
+            InlineItem::Form(form) => (form.width, None),
         };
 
         match (link, active.as_mut()) {
@@ -1002,7 +2178,7 @@ fn collect_links(items: &[InlineItem]) -> Vec<LinkRect> {
     links
 }
 
-fn list_marker(style: ListStyle, value: i64) -> Option<String> {
+fn list_marker(style: &ListStyle, value: i64, styles: &[CounterStyle]) -> Option<String> {
     let marker = match style {
         ListStyle::Disc => "• ".to_string(),
         ListStyle::Circle => "○ ".to_string(),
@@ -1013,9 +2189,10 @@ fn list_marker(style: ListStyle, value: i64) -> Option<String> {
         ListStyle::UpperAlpha => format!("{}. ", dec2base26(value, false)),
         ListStyle::LowerRoman => format!("{}. ", dec2roman(value).to_ascii_lowercase()),
         ListStyle::UpperRoman => format!("{}. ", dec2roman(value)),
+        ListStyle::Custom(name) => format_counter_value(value as i32, name, styles),
     };
 
-    Some(marker)
+    (!marker.is_empty()).then_some(marker)
 }
 
 fn dec2base26(value: i64, lowercase: bool) -> String {
@@ -1063,6 +2240,75 @@ fn dec2roman(value: i64) -> String {
     roman
 }
 
+fn custom_counter_symbol(value: i32, style: &CounterStyle) -> String {
+    let base = style.symbols.len().max(1);
+    let index = |value: i32| ((value - 1).rem_euclid(base as i32)) as usize;
+    match style.system {
+        CounterSystem::Cyclic | CounterSystem::Symbolic => style
+            .symbols
+            .get(index(value.max(1)))
+            .cloned()
+            .unwrap_or_default(),
+        CounterSystem::Fixed => {
+            if value >= 1 {
+                style
+                    .symbols
+                    .get((value - 1) as usize)
+                    .cloned()
+                    .unwrap_or_else(|| value.to_string())
+            } else {
+                value.to_string()
+            }
+        }
+        CounterSystem::Numeric => positional_symbol(value, base, &style.symbols, false),
+        CounterSystem::Alphabetic => positional_symbol(value, base, &style.symbols, true),
+    }
+}
+
+fn positional_symbol(value: i32, base: usize, symbols: &[String], bijective: bool) -> String {
+    if value <= 0 || base <= 1 {
+        return value.to_string();
+    }
+    let mut digits = Vec::new();
+    let mut remaining = value as usize;
+    while remaining > 0 {
+        if bijective {
+            remaining -= 1;
+            digits.push(symbols[remaining % base].clone());
+            remaining /= base;
+        } else {
+            digits.push(symbols[remaining % base].clone());
+            remaining /= base;
+        }
+    }
+    digits.reverse();
+    digits.concat()
+}
+
+fn format_counter_value(value: i32, name: &str, styles: &[CounterStyle]) -> String {
+    let name = name.trim().trim_matches(['"', '\'']);
+    if let Some(style) = styles.iter().find(|style| style.name == name) {
+        return format!(
+            "{}{}{}",
+            style.prefix,
+            custom_counter_symbol(value, style),
+            style.suffix
+        );
+    }
+
+    match name {
+        "disc" => "•".to_string(),
+        "circle" => "○".to_string(),
+        "square" => "▪".to_string(),
+        "none" => String::new(),
+        "lower-alpha" | "lower-latin" => dec2base26(value as i64, true),
+        "upper-alpha" | "upper-latin" => dec2base26(value as i64, false),
+        "lower-roman" => dec2roman(value as i64).to_ascii_lowercase(),
+        "upper-roman" => dec2roman(value as i64),
+        _ => value.to_string(),
+    }
+}
+
 fn increment_counter(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
     if let Some((name, delta)) = &style.counter_increment {
         let values = counters.entry(name.clone()).or_insert_with(|| vec![0]);
@@ -1082,35 +2328,55 @@ fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) 
             counters.insert(name.clone(), vec![*value]);
         }
     }
+    if let Some((name, value)) = &style.counter_set {
+        let values = counters.entry(name.clone()).or_default();
+        if let Some(last) = values.last_mut() {
+            *last = *value;
+        } else {
+            values.push(*value);
+        }
+    }
     increment_counter(counters, style);
 }
 
-fn format_counter(counters: &HashMap<String, Vec<i32>>, name: &str) -> String {
-    counters
+fn format_counter(
+    counters: &HashMap<String, Vec<i32>>,
+    name: &str,
+    style_name: &str,
+    styles: &[CounterStyle],
+) -> String {
+    let value = counters
         .get(name)
         .and_then(|values| values.last())
         .copied()
-        .unwrap_or(0)
-        .to_string()
+        .unwrap_or(0);
+    format_counter_value(value, style_name, styles)
 }
 
-fn format_counters(counters: &HashMap<String, Vec<i32>>, name: &str, separator: &str) -> String {
+fn format_counters(
+    counters: &HashMap<String, Vec<i32>>,
+    name: &str,
+    separator: &str,
+    style_name: &str,
+    styles: &[CounterStyle],
+) -> String {
     counters
         .get(name)
         .map(|values| {
             values
                 .iter()
-                .map(|value| value.to_string())
+                .map(|value| format_counter_value(*value, style_name, styles))
                 .collect::<Vec<_>>()
                 .join(separator)
         })
-        .unwrap_or_else(|| "0".to_string())
+        .unwrap_or_else(|| format_counter_value(0, style_name, styles))
 }
 
 fn resolve_generated_content(
     input: &str,
     element: &ElementRef,
     counters: &HashMap<String, Vec<i32>>,
+    styles: &[CounterStyle],
 ) -> Option<String> {
     let mut output = String::new();
     let mut rest = input.trim();
@@ -1124,14 +2390,19 @@ fn resolve_generated_content(
             let mut args = after[..end].split(',');
             let name = args.next().unwrap_or("").trim().trim_matches(['"', '\'']);
             let separator = args.next().unwrap_or(".").trim().trim_matches(['"', '\'']);
-            output.push_str(&format_counters(counters, name, separator));
+            let style_name = args.next().unwrap_or("decimal").trim();
+            output.push_str(&format_counters(
+                counters, name, separator, style_name, styles,
+            ));
             rest = after[end + 1..].trim_start();
         } else if let Some(after) = rest.strip_prefix("counter(") {
             let Some(end) = after.find(')') else {
                 break;
             };
-            let name = after[..end].trim().trim_matches(['"', '\'']);
-            output.push_str(&format_counter(counters, name));
+            let mut args = after[..end].split(',');
+            let name = args.next().unwrap_or("").trim().trim_matches(['"', '\'']);
+            let style_name = args.next().unwrap_or("decimal").trim();
+            output.push_str(&format_counter(counters, name, style_name, styles));
             rest = after[end + 1..].trim_start();
         } else if quote == '"' || quote == '\'' {
             let Some(end) = rest[1..].find(quote) else {
@@ -1262,6 +2533,9 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             Clear::None => 0.0,
         };
         collector.cursor = collector.cursor.max(bottom);
+        collector
+            .floats
+            .retain(|float| float.bottom > collector.cursor);
     }
 
     if style.float != Float::None {
@@ -1292,6 +2566,21 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
 
     if tag == "br" {
         collector.flush_line();
+        collector.link = previous_link;
+        return;
+    }
+
+    if matches!(tag, "input" | "textarea" | "select" | "button") {
+        let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
+        if tag == "input" && input_type == "hidden" {
+            collector.link = previous_link;
+            return;
+        }
+        let mut width = 120.0;
+        let mut height = 20.0;
+        let control = form_control(&element, &style, collector, &mut width, &mut height);
+        collector.form_count += 1;
+        collector.push_form_item(control, width, height, &style);
         collector.link = previous_link;
         return;
     }
@@ -1344,7 +2633,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             1
         };
         collector.lists.push(ListState {
-            style: style.list_style,
+            style: style.list_style.clone(),
             counter: start,
             step,
         });
@@ -1354,6 +2643,17 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if is_block {
         collector.start_block(&style);
     }
+    let previous_struct_role = collector.struct_role;
+    collector.struct_role = match heading_level(tag) {
+        Some(1) => StructureRole::Heading1,
+        Some(2) => StructureRole::Heading2,
+        Some(3) => StructureRole::Heading3,
+        Some(4) => StructureRole::Heading4,
+        Some(5) => StructureRole::Heading5,
+        Some(6) => StructureRole::Heading6,
+        _ if tag == "li" => StructureRole::ListItem,
+        _ => collector.struct_role,
+    };
 
     if tag == "li" {
         let prefix = collector
@@ -1362,7 +2662,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             .and_then(|state| {
                 let value = state.counter;
                 state.counter += state.step;
-                list_marker(state.style, value)
+                list_marker(&state.style, value, &collector.counter_styles)
             })
             .unwrap_or_else(|| "• ".to_string());
         collector.push_text(&prefix, &style);
@@ -1376,14 +2676,22 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     let mut after_counters = collector.counters.clone();
     apply_counter_style(&mut after_counters, &after_style);
     increment_counter(&mut collector.counters, &after_style);
-    let before_content = before_style
-        .content
-        .as_deref()
-        .and_then(|content| resolve_generated_content(content, &element, &before_counters));
-    let after_content = after_style
-        .content
-        .as_deref()
-        .and_then(|content| resolve_generated_content(content, &element, &after_counters));
+    let before_content = before_style.content.as_deref().and_then(|content| {
+        resolve_generated_content(
+            content,
+            &element,
+            &before_counters,
+            &collector.counter_styles,
+        )
+    });
+    let after_content = after_style.content.as_deref().and_then(|content| {
+        resolve_generated_content(
+            content,
+            &element,
+            &after_counters,
+            &collector.counter_styles,
+        )
+    });
 
     if let Some(content) = &before_content {
         collector.push_text(content, &before_style);
@@ -1408,6 +2716,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if starts_list {
         collector.lists.pop();
     }
+    collector.struct_role = previous_struct_role;
     collector.link = previous_link;
 }
 
@@ -1509,11 +2818,14 @@ fn emit_prepared_row(
             background_size: cell.style.background_size,
             background_position_x: cell.style.background_position_x,
             background_position_y: cell.style.background_position_y,
+            background_position_x_is_length: cell.style.background_position_x_is_length,
+            background_position_y_is_length: cell.style.background_position_y_is_length,
             background_width: Some(cell_width),
             border: cell.style.border,
             opacity: cell.style.opacity,
             border_radius: cell.style.border_radius,
             links: Vec::new(),
+            struct_role: StructureRole::Paragraph,
         };
         collector.push_line(box_line);
 
@@ -1788,6 +3100,9 @@ fn layout_overlay<'a>(
     let saved_block = collector.block.clone();
     let saved_stack_len = collector.style_stack.len();
     let saved_pages = collector.pages.len();
+    let saved_floats = collector.floats.clone();
+    let saved_float_indent = collector.float_indent;
+    let saved_line_max_width = collector.line_max_width;
     let saved_anchors = collector.anchors.len();
     let saved_bookmarks = collector.bookmarks.len();
 
@@ -1826,6 +3141,9 @@ fn layout_overlay<'a>(
     collector.style_stack.truncate(saved_stack_len);
     collector.max_width = saved_max;
     collector.page_height = saved_page_height;
+    collector.floats = saved_floats;
+    collector.float_indent = saved_float_indent;
+    collector.line_max_width = saved_line_max_width;
     collector.cursor = saved_cursor;
     collector.align = saved_align;
     collector.pending_before = saved_pending;
@@ -1899,11 +3217,14 @@ fn layout_overlay<'a>(
             background_size: style.background_size,
             background_position_x: style.background_position_x,
             background_position_y: style.background_position_y,
+            background_position_x_is_length: style.background_position_x_is_length,
+            background_position_y_is_length: style.background_position_y_is_length,
             background_width: Some(box_width),
             border: style.border,
             opacity: style.opacity,
             border_radius: style.border_radius,
             links: Vec::new(),
+            struct_role: StructureRole::Paragraph,
         },
     });
 
@@ -1919,6 +3240,13 @@ fn layout_overlay<'a>(
 
     if let Some(side) = float {
         let bottom = y + box_height;
+        collector.floats.push(FloatRect {
+            side,
+            left: x,
+            width: box_width,
+            top: y,
+            bottom,
+        });
         match side {
             Float::Left => collector.float_left_bottom = collector.float_left_bottom.max(bottom),
             Float::Right => collector.float_right_bottom = collector.float_right_bottom.max(bottom),
@@ -1961,4 +3289,57 @@ pub fn measure(text: &str, size: f32, font: FontId, fonts: &[EmbeddedFont]) -> f
         .sum::<u32>();
 
     units as f32 / 1000.0 * size
+}
+
+#[cfg(test)]
+mod woff2_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_woff2_triplets() {
+        assert_eq!(decode_woff2_triplet(21, &[0x21]), Some((3, -2, 1)));
+        assert_eq!(decode_woff2_triplet(84, &[0x05, 0x0a]), Some((-6, -11, 2)));
+        assert_eq!(
+            decode_woff2_triplet(125, &[0x01, 0x02, 0x03, 0x04]),
+            Some((258, -772, 4))
+        );
+    }
+
+    #[test]
+    fn reconstructs_empty_transformed_glyf() {
+        let mut data = Vec::new();
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 2);
+        push_u16(&mut data, 0);
+        for size in [4u32, 0, 0, 0, 0, 4, 0] {
+            push_u32(&mut data, size);
+        }
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        data.extend_from_slice(&[0u8; 4]);
+
+        let (glyf, loca, xmins, count) = inverse_woff2_glyf(&data).unwrap();
+        assert!(glyf.is_empty());
+        assert_eq!(loca, vec![0, 0, 0, 0, 0, 0]);
+        assert_eq!(xmins, vec![0, 0]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn reconstructs_transformed_hmtx() {
+        let mut data = vec![2u8];
+        push_u16(&mut data, 500);
+        push_u16(&mut data, 600);
+        push_i16(&mut data, -10);
+        push_i16(&mut data, 20);
+        let output = inverse_woff2_hmtx(&data, 3, 2, &[100, 200, 30]).unwrap();
+        let mut expected = Vec::new();
+        push_u16(&mut expected, 500);
+        push_i16(&mut expected, -10);
+        push_u16(&mut expected, 600);
+        push_i16(&mut expected, 20);
+        push_i16(&mut expected, 30);
+        assert_eq!(output, expected);
+    }
 }

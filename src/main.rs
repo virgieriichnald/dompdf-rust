@@ -21,6 +21,9 @@ fn help() {
     println!(
         "  --page-text-location POS  top-left|top-center|top-right|bottom-left|bottom-center|bottom-right"
     );
+    println!("  --encrypt PASSWORD  Encrypt output with RC4 40-bit standard security");
+    println!("  --owner-password PASSWORD  Separate owner password");
+    println!("  --pdf-a        Add basic PDF/A-1b output intent and XMP metadata");
     println!("  --help         Show this help");
 }
 
@@ -123,6 +126,22 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                 })?;
                 options = options.page_text_location(location);
             }
+            "--encrypt" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--encrypt needs a value")
+                })?;
+                options = options.encrypt(&value);
+            }
+            "--owner-password" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--owner-password needs a value",
+                    )
+                })?;
+                options = options.owner_password(&value);
+            }
+            "--pdf-a" => options = options.pdf_a(),
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

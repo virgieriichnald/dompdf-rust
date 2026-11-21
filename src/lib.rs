@@ -150,6 +150,9 @@ pub struct Options {
     pub resource: ResourcePolicy,
     pub page_text: Option<String>,
     pub page_text_location: PageTextLocation,
+    pub user_password: Option<String>,
+    pub owner_password: Option<String>,
+    pub pdf_a: bool,
 }
 
 impl Default for Options {
@@ -164,6 +167,9 @@ impl Default for Options {
             resource: ResourcePolicy::default(),
             page_text: None,
             page_text_location: PageTextLocation::BottomCenter,
+            user_password: None,
+            owner_password: None,
+            pdf_a: false,
         }
     }
 }
@@ -227,6 +233,21 @@ impl Options {
 
     pub fn page_text_location(mut self, location: PageTextLocation) -> Self {
         self.page_text_location = location;
+        self
+    }
+
+    pub fn encrypt(mut self, user_password: &str) -> Self {
+        self.user_password = Some(user_password.to_string());
+        self
+    }
+
+    pub fn owner_password(mut self, owner_password: &str) -> Self {
+        self.owner_password = Some(owner_password.to_string());
+        self
+    }
+
+    pub fn pdf_a(mut self) -> Self {
+        self.pdf_a = true;
         self
     }
 }

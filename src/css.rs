@@ -43,7 +43,7 @@ pub enum TextAlign {
     Justify,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ListStyle {
     #[default]
     Disc,
@@ -55,6 +55,26 @@ pub enum ListStyle {
     LowerRoman,
     UpperRoman,
     None,
+    Custom(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CounterSystem {
+    #[default]
+    Symbolic,
+    Cyclic,
+    Numeric,
+    Alphabetic,
+    Fixed,
+}
+
+#[derive(Clone, Debug)]
+pub struct CounterStyle {
+    pub name: String,
+    pub system: CounterSystem,
+    pub symbols: Vec<String>,
+    pub prefix: String,
+    pub suffix: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -260,6 +280,8 @@ pub struct Style {
     pub background_size: BackgroundSize,
     pub background_position_x: f32,
     pub background_position_y: f32,
+    pub background_position_x_is_length: bool,
+    pub background_position_y_is_length: bool,
     pub border: Option<BorderSpec>,
     pub opacity: f32,
     pub border_radius: [f32; 4],
@@ -270,6 +292,7 @@ pub struct Style {
     pub display: Display,
     pub px_scale: f32,
     pub containing_width: f32,
+    pub containing_height: f32,
     pub list_style: ListStyle,
     pub text_indent: Length,
     pub letter_spacing: Length,
@@ -277,6 +300,7 @@ pub struct Style {
     pub page_name: Option<String>,
     pub content: Option<String>,
     pub counter_reset: Option<(String, i32)>,
+    pub counter_set: Option<(String, i32)>,
     pub counter_increment: Option<(String, i32)>,
     pub position: Position,
     pub float: Float,
@@ -317,6 +341,8 @@ impl Default for Style {
             background_size: BackgroundSize::Auto,
             background_position_x: 0.0,
             background_position_y: 0.0,
+            background_position_x_is_length: false,
+            background_position_y_is_length: false,
             border: None,
             opacity: 1.0,
             border_radius: [0.0; 4],
@@ -327,6 +353,7 @@ impl Default for Style {
             display: Display::Inline,
             px_scale: px_scale(DEFAULT_DPI),
             containing_width: 0.0,
+            containing_height: 0.0,
             list_style: ListStyle::Disc,
             text_indent: Length::default(),
             letter_spacing: Length::default(),
@@ -334,6 +361,7 @@ impl Default for Style {
             page_name: None,
             content: None,
             counter_reset: None,
+            counter_set: None,
             counter_increment: None,
             position: Position::Static,
             float: Float::None,
@@ -363,7 +391,8 @@ impl Style {
             line_height: parent.line_height,
             px_scale: parent.px_scale,
             containing_width: parent.containing_width,
-            list_style: parent.list_style,
+            containing_height: parent.containing_height,
+            list_style: parent.list_style.clone(),
             text_indent: parent.text_indent,
             letter_spacing: parent.letter_spacing,
             white_space: parent.white_space,
@@ -551,6 +580,22 @@ pub fn parse_font_faces(
     }
 
     faces
+}
+
+pub fn parse_counter_styles(
+    html: &scraper::Html,
+    base: &Path,
+    media: &MediaContext,
+    policy: &ResourcePolicy,
+) -> Vec<CounterStyle> {
+    let sheets = stylesheets(html, base, media, policy);
+    let mut styles = Vec::new();
+
+    for (text, _) in &sheets {
+        styles.extend(parse_counter_styles_css(text));
+    }
+
+    styles
 }
 
 pub fn parse_page_rules(
@@ -953,6 +998,103 @@ fn parse_font_faces_css(input: &str, base: &Path) -> Vec<FontFace> {
     }
 
     faces
+}
+
+fn parse_counter_styles_css(input: &str) -> Vec<CounterStyle> {
+    let clean = strip_comments(input);
+    let mut styles = Vec::new();
+    let mut rest = clean.as_str();
+
+    while let Some((prelude, body, end)) = find_block(rest, 0) {
+        rest = &rest[end..];
+        let Some(name) = prelude.strip_prefix("@counter-style") else {
+            continue;
+        };
+        let name = name.trim().trim_matches(['"', '\'']).to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        let mut system = CounterSystem::Symbolic;
+        let mut symbols = Vec::new();
+        let mut prefix = String::new();
+        let mut suffix = None;
+        for declaration in parse_declarations_detailed(&body) {
+            match declaration.property.as_str() {
+                "system" => {
+                    system = match declaration.value.trim().to_ascii_lowercase().as_str() {
+                        "cyclic" => CounterSystem::Cyclic,
+                        "numeric" => CounterSystem::Numeric,
+                        "alphabetic" => CounterSystem::Alphabetic,
+                        "fixed" => CounterSystem::Fixed,
+                        _ => CounterSystem::Symbolic,
+                    };
+                }
+                "symbols" => symbols = split_css_tokens(&declaration.value),
+                "prefix" => {
+                    prefix = split_css_tokens(&declaration.value)
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                "suffix" => {
+                    suffix = Some(
+                        split_css_tokens(&declaration.value)
+                            .first()
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if symbols.is_empty() {
+            continue;
+        }
+        styles.push(CounterStyle {
+            name,
+            system,
+            symbols,
+            prefix,
+            suffix: suffix.unwrap_or_else(|| ". ".to_string()),
+        });
+    }
+
+    styles
+}
+
+fn split_css_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+
+    for ch in input.chars() {
+        if let Some(marker) = quote {
+            current.push(ch);
+            if ch == marker {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                current.push(ch);
+                quote = Some(ch);
+            }
+            ch if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(current.trim_matches(['"', '\'']).to_string());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current.trim_matches(['"', '\'']).to_string());
+    }
+    tokens
 }
 
 fn clean_family(value: &str) -> Option<String> {
@@ -1379,7 +1521,13 @@ fn apply_cascaded(style: &mut Style, parent: &Style, mut declarations: Vec<Casca
         })
         .collect::<Vec<_>>();
     style.variables = variables;
-    apply_style_declarations(style, &resolved, parent.font_size, parent.containing_width);
+    apply_style_declarations(
+        style,
+        &resolved,
+        parent.font_size,
+        parent.containing_width,
+        parent.containing_height,
+    );
 }
 
 fn resolve_value(
@@ -1493,6 +1641,7 @@ fn list_style_name(style: ListStyle) -> &'static str {
         ListStyle::LowerRoman => "lower-roman",
         ListStyle::UpperRoman => "upper-roman",
         ListStyle::None => "none",
+        ListStyle::Custom(_) => "disc",
     }
 }
 
@@ -1514,7 +1663,7 @@ pub fn apply_declarations(style: &mut Style, declarations: &[(String, String)], 
             important: false,
         })
         .collect::<Vec<_>>();
-    apply_style_declarations(style, &detailed, parent_size, parent_size);
+    apply_style_declarations(style, &detailed, parent_size, parent_size, parent_size);
 }
 
 fn apply_style_declarations(
@@ -1522,6 +1671,7 @@ fn apply_style_declarations(
     declarations: &[Declaration],
     parent_size: f32,
     containing_width: f32,
+    containing_height: f32,
 ) {
     let mut line_height_value = None;
 
@@ -1649,6 +1799,7 @@ fn apply_style_declarations(
                 }
             }
             "counter-reset" => style.counter_reset = parse_counter(value, 0),
+            "counter-set" => style.counter_set = parse_counter(value, 0),
             "counter-increment" => style.counter_increment = parse_counter(value, 1),
             "font-family" => {
                 if let Some(family) = clean_family(value) {
@@ -1688,29 +1839,39 @@ fn apply_style_declarations(
             }
             "background-position" => {
                 let tokens: Vec<_> = value.split_whitespace().collect();
-                let resolve = |token: &str| match token.to_ascii_lowercase().as_str() {
-                    "left" | "top" => Some(0.0),
-                    "center" => Some(0.5),
-                    "right" | "bottom" => Some(1.0),
-                    _ => parse_length_resolved(
-                        token,
-                        style.font_size,
-                        containing_width,
-                        style.px_scale,
-                    )
-                    .map(|length| {
-                        length.resolve_with_size(style.font_size, containing_width, style.px_scale)
-                            / containing_width.max(1.0)
-                    }),
+                let resolve = |token: &str, basis: f32| match token.to_ascii_lowercase().as_str() {
+                    "left" | "top" => Some((0.0, false)),
+                    "center" => Some((0.5, false)),
+                    "right" | "bottom" => Some((1.0, false)),
+                    _ => parse_length_resolved(token, style.font_size, basis, style.px_scale).map(
+                        |length| {
+                            let resolved =
+                                length.resolve_with_size(style.font_size, basis, style.px_scale);
+                            if length.unit == Unit::Percent {
+                                (resolved / basis.max(1.0), false)
+                            } else {
+                                (resolved, true)
+                            }
+                        },
+                    ),
                 };
-                if let Some(x) = tokens.first().and_then(|token| resolve(token)) {
+                if let Some((x, is_length)) = tokens
+                    .first()
+                    .and_then(|token| resolve(token, containing_width))
+                {
                     style.background_position_x = x;
+                    style.background_position_x_is_length = is_length;
                     if tokens.len() == 1 {
-                        style.background_position_y = x;
+                        style.background_position_y = 0.5;
+                        style.background_position_y_is_length = false;
                     }
                 }
-                if let Some(y) = tokens.get(1).and_then(|token| resolve(token)) {
+                if let Some((y, is_length)) = tokens
+                    .get(1)
+                    .and_then(|token| resolve(token, containing_height))
+                {
                     style.background_position_y = y;
+                    style.background_position_y_is_length = is_length;
                 }
             }
             "opacity" => {
@@ -1866,7 +2027,8 @@ fn apply_style_declarations(
                 }
             }
             "list-style-type" => {
-                style.list_style = match value.trim().to_ascii_lowercase().as_str() {
+                let raw = value.trim();
+                style.list_style = match raw.to_ascii_lowercase().as_str() {
                     "disc" => ListStyle::Disc,
                     "circle" => ListStyle::Circle,
                     "square" => ListStyle::Square,
@@ -1876,7 +2038,7 @@ fn apply_style_declarations(
                     "lower-roman" => ListStyle::LowerRoman,
                     "upper-roman" => ListStyle::UpperRoman,
                     "none" => ListStyle::None,
-                    _ => style.list_style,
+                    _ => ListStyle::Custom(raw.trim_matches(['"', '\'']).to_string()),
                 };
             }
             "text-indent" => {

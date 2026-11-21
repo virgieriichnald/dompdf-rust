@@ -443,6 +443,126 @@ fn embeds_ttf_font() {
     assert!(raw.contains("Tj"));
 }
 
+fn encode_woff2_base128(value: u32, output: &mut Vec<u8>) {
+    let mut value = value;
+    let mut bytes = Vec::new();
+    loop {
+        bytes.push((value & 0x7f) as u8);
+        value >>= 7;
+        if value == 0 {
+            break;
+        }
+    }
+    bytes.reverse();
+    let count = bytes.len();
+    for (index, byte) in bytes.into_iter().enumerate() {
+        output.push(if index + 1 == count {
+            byte
+        } else {
+            byte | 0x80
+        });
+    }
+}
+
+fn make_test_woff2(ttf: &[u8]) -> Vec<u8> {
+    fn u16be(bytes: &[u8], offset: usize) -> usize {
+        u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize
+    }
+    fn u32be(bytes: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize
+    }
+    fn known_index(tag: &[u8; 4]) -> Option<u8> {
+        let tags = [
+            b"cmap", b"head", b"hhea", b"hmtx", b"maxp", b"name", b"OS/2", b"post", b"cvt ",
+            b"fpgm", b"glyf", b"loca", b"prep", b"CFF ", b"VORG", b"EBDT", b"EBLC", b"gasp",
+            b"hdmx", b"kern", b"LTSH", b"PCLT", b"VDMX", b"vhea", b"vmtx", b"BASE", b"GDEF",
+            b"GPOS", b"GSUB", b"EBSC", b"JSTF", b"MATH", b"CBDT", b"CBLC", b"COLR", b"CPAL",
+            b"SVG ", b"sbix", b"acnt", b"avar", b"bdat", b"bloc", b"bsln", b"cvar", b"fdsc",
+            b"feat", b"fmtx", b"fvar", b"gvar", b"hsty", b"just", b"lcar", b"mort", b"morx",
+            b"opbd", b"prop", b"trak", b"Zapf", b"Silf", b"Glat", b"Gloc", b"Feat", b"Sill",
+        ];
+        tags.iter()
+            .position(|candidate| **candidate == *tag)
+            .map(|index| index as u8)
+    }
+
+    let num_tables = u16be(ttf, 4);
+    let mut directory = Vec::new();
+    let mut font_data = Vec::new();
+    for index in 0..num_tables {
+        let record = 12 + index * 16;
+        let tag = &ttf[record..record + 4];
+        let tag = <&[u8; 4]>::try_from(tag).unwrap();
+        let offset = u32be(ttf, record + 8);
+        let length = u32be(ttf, record + 12);
+        let data = &ttf[offset..offset + length];
+        let known = known_index(tag);
+        let mut flags = known.unwrap_or(63);
+        if tag == b"glyf" || tag == b"loca" {
+            flags |= 3 << 6;
+        }
+        if known.is_none() {
+            directory.push(flags);
+            directory.extend_from_slice(tag);
+        } else {
+            directory.push(flags);
+        }
+        encode_woff2_base128(length as u32, &mut directory);
+        font_data.extend_from_slice(data);
+    }
+
+    let mut compressed = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 11, 22);
+        std::io::Write::write_all(&mut writer, &font_data).unwrap();
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(b"wOF2");
+    output.extend_from_slice(&ttf[0..4]);
+    let total_len = 48 + directory.len() + compressed.len();
+    output.extend_from_slice(&(total_len as u32).to_be_bytes());
+    output.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output.extend_from_slice(&(ttf.len() as u32).to_be_bytes());
+    output.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    output.extend_from_slice(&1u16.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output.extend_from_slice(&[0u8; 20]);
+    output.extend_from_slice(&directory);
+    output.extend_from_slice(&compressed);
+    output
+}
+
+#[test]
+fn embeds_woff2_font() {
+    use std::fs;
+
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/fonts/DejaVuSans.ttf");
+    let ttf = fs::read(source).unwrap();
+    let woff2 = make_test_woff2(&ttf);
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-woff2-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("DejaVuSans.woff2");
+    fs::write(&path, &woff2).unwrap();
+
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<style>@font-face{font-family:DejaVu;src:url('DejaVuSans.woff2');}\
+         p{font-family:DejaVu}</style><p>Halo WOFF2</p>",
+        &directory,
+    );
+    fs::remove_dir_all(&directory).unwrap();
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/FontFile2"), "missing embedded font");
+    assert!(raw.contains("Tj"), "missing text");
+}
+
 #[test]
 fn applies_media_rules_and_conditional_imports() {
     use std::fs;
@@ -606,6 +726,38 @@ fn text_matrices(raw: &str) -> Vec<(f32, f32)> {
 }
 
 #[test]
+fn encrypts_pdf_with_standard_security() {
+    let options = html2pdf_rs::Options::default().encrypt("secret");
+    let pdf = html2pdf_rs::render_html_with_options(
+        "<p>Halaman terenkripsi</p>",
+        std::path::Path::new("."),
+        &options,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/Encrypt "), "missing Encrypt entry");
+    assert!(raw.contains("/Filter /Standard"), "missing standard filter");
+    assert!(raw.contains("/ID [<"), "missing file ID");
+    assert!(raw.contains("startxref"), "missing xref");
+}
+
+#[test]
+fn writes_pdf_a_output_intent_and_metadata() {
+    let options = html2pdf_rs::Options::default().pdf_a();
+    let pdf = html2pdf_rs::render_html_with_options(
+        "<html lang=\"id\"><head><title>PDF A</title></head><body><p>Halo</p></body></html>",
+        std::path::Path::new("."),
+        &options,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.starts_with("%PDF-1.4"), "wrong PDF version");
+    assert!(raw.contains("/GTS_PDFA1"), "missing PDF/A output intent");
+    assert!(raw.contains("/Type /Metadata"), "missing XMP metadata");
+    assert!(raw.contains("/Lang (id)"), "missing document language");
+}
+
+#[test]
 fn renders_background_image_with_opacity_and_radius() {
     use base64::Engine;
     use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
@@ -700,6 +852,18 @@ fn applies_rgba_alpha_to_text_background_and_border() {
     assert!(raw.contains("/ca 0.5"));
     assert!(raw.contains("/ca 0.25"));
     assert!(raw.contains("/ca 0.75"));
+}
+
+#[test]
+fn wraps_text_around_floats() {
+    let pdf = html2pdf_rs::render_html(
+        "<div style='float:left'>F</div><p>AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+    let first_text_x = matrices.first().map(|(x, _)| *x).unwrap_or(0.0);
+
+    assert!(first_text_x > 100.0, "x={first_text_x}");
 }
 
 #[test]
@@ -824,4 +988,194 @@ fn omits_outlines_without_headings() {
 
     assert!(!raw.contains("/Type /Outlines"));
     assert!(!raw.contains("/PageMode /UseOutlines"));
+}
+
+#[test]
+fn supports_counter_set() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>counter { counter-reset: x 0 }\
+         p { counter-set: x 5; counter-increment: x }\
+         p::before { content: counter(x) }</style>\
+         <counter><p>A</p></counter>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(6)"));
+}
+
+#[test]
+fn supports_custom_counter_style() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@counter-style ticks { system: cyclic; symbols: '*' '+'; suffix: '' }\
+         ol { list-style-type: ticks }\
+         li::before { content: counter(list-item, ticks) }</style>\
+         <ol><li>A</li><li>B</li></ol>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(*)"));
+    assert!(raw.contains("(+)"));
+}
+
+fn encode_woff1(sfnt: &[u8]) -> Vec<u8> {
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    let get_u16 = |offset: usize| u16::from_be_bytes(sfnt[offset..offset + 2].try_into().unwrap());
+    let get_u32 = |offset: usize| u32::from_be_bytes(sfnt[offset..offset + 4].try_into().unwrap());
+    let flavor = get_u32(0);
+    let num_tables = get_u16(4) as usize;
+    let mut directory = Vec::new();
+    let mut payload = Vec::new();
+
+    for index in 0..num_tables {
+        let base = 12 + index * 16;
+        let tag = get_u32(base);
+        let checksum = get_u32(base + 4);
+        let offset = get_u32(base + 8) as usize;
+        let length = get_u32(base + 12) as usize;
+        let original = &sfnt[offset..offset + length];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let compressed = if encoded.len() < original.len() {
+            encoded
+        } else {
+            original.to_vec()
+        };
+        let table_offset = 44 + num_tables * 20 + payload.len();
+        directory.extend_from_slice(&tag.to_be_bytes());
+        directory.extend_from_slice(&(table_offset as u32).to_be_bytes());
+        directory.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        directory.extend_from_slice(&(length as u32).to_be_bytes());
+        directory.extend_from_slice(&checksum.to_be_bytes());
+        payload.extend_from_slice(&compressed);
+        let padding = (4 - payload.len() % 4) % 4;
+        payload.resize(payload.len() + padding, 0);
+    }
+
+    let mut woff = Vec::new();
+    woff.extend_from_slice(b"wOFF");
+    woff.extend_from_slice(&flavor.to_be_bytes());
+    woff.extend_from_slice(&((44 + directory.len() + payload.len()) as u32).to_be_bytes());
+    woff.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    woff.extend_from_slice(&0u16.to_be_bytes());
+    woff.extend_from_slice(&(sfnt.len() as u32).to_be_bytes());
+    woff.extend_from_slice(&1u16.to_be_bytes());
+    woff.extend_from_slice(&0u16.to_be_bytes());
+    woff.extend_from_slice(&0u32.to_be_bytes());
+    woff.extend_from_slice(&0u32.to_be_bytes());
+    woff.extend_from_slice(&0u32.to_be_bytes());
+    woff.extend_from_slice(&0u32.to_be_bytes());
+    woff.extend_from_slice(&0u32.to_be_bytes());
+    woff.extend_from_slice(&directory);
+    woff.extend_from_slice(&payload);
+    woff
+}
+
+#[test]
+fn writes_tagged_pdf_structure() {
+    let pdf = html2pdf_rs::render_html("<html lang='id'><h1>Judul</h1><p>Isi</p></html>");
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/StructTreeRoot"));
+    assert!(raw.contains("/MarkInfo"));
+    assert!(raw.contains("/Marked true"));
+    assert!(raw.contains("/Lang (id)"));
+    assert!(raw.contains("/S /H1"));
+    assert!(raw.contains("/ParentTree"));
+    assert!(raw.contains("/MCID"));
+}
+
+#[test]
+fn embeds_woff_font() {
+    use std::fs;
+
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/fonts");
+    let woff = encode_woff1(&fs::read(source.join("DejaVuSans.ttf")).unwrap());
+    let directory = std::env::temp_dir().join(format!("html2pdf-rs-woff-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("DejaVu.woff"), woff).unwrap();
+
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<style>@font-face{font-family:W;src:url('DejaVu.woff')}\
+         p{font-family:W}</style><p>Halo WOFF</p>",
+        &directory,
+    );
+    fs::remove_dir_all(&directory).ok();
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/FontFile2"));
+    assert!(raw.contains("Tj"));
+}
+
+#[test]
+fn renders_acroform_fields() {
+    let pdf = html2pdf_rs::render_html(
+        "<form><input name='q' value='Halo'><input type='checkbox' name='ok' checked>\
+         <select name='kota'><option>Jakarta</option><option selected>Bandung</option></select>\
+         </form>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/AcroForm"));
+    assert!(raw.contains("/FT /Tx"));
+    assert!(raw.contains("/FT /Btn"));
+    assert!(raw.contains("/FT /Ch"));
+    assert!(raw.contains("/T (q)"));
+    assert!(raw.contains("/T (ok)"));
+    assert!(raw.contains("/V (Halo)"));
+    assert!(raw.contains("/Opt [(Jakarta) (Bandung)]"));
+}
+
+#[test]
+fn embeds_document_and_inline_javascript() {
+    let pdf = html2pdf_rs::render_html(
+        "<script>app.alert('halo');</script><button onclick='app.alert(\"klik\")'>Klik</button>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/JavaScript <<"));
+    assert!(raw.contains("/S /JavaScript"));
+    assert!(raw.contains("app.alert('halo')"));
+    assert!(raw.contains("app.alert(\"klik\")"));
+}
+
+#[test]
+fn resolves_background_position_length_against_container_height() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let render_at = |offset: &str| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+             background-repeat: no-repeat; background-size: 20pt 20pt; line-height: 10; \
+             background-position: right {offset} }}</style><div>X</div>"
+        ));
+        let raw = String::from_utf8_lossy(&pdf);
+        raw.lines()
+            .filter(|line| line.trim_end().ends_with(" cm"))
+            .filter_map(|line| {
+                let values = line
+                    .trim()
+                    .trim_end_matches(" cm")
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<f32>().ok())
+                    .collect::<Vec<_>>();
+                (values.len() == 6 && (values[0] - 20.0).abs() < 0.01).then_some(values[5])
+            })
+            .find(|y| *y > 0.0)
+            .unwrap_or(0.0)
+    };
+
+    let top = render_at("0pt");
+    let shifted = render_at("30pt");
+
+    assert!((top - shifted - 30.0).abs() < 1.0);
 }

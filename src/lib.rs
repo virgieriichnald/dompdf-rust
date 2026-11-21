@@ -152,7 +152,9 @@ pub struct Options {
     pub page_text_location: PageTextLocation,
     pub user_password: Option<String>,
     pub owner_password: Option<String>,
+    pub aes_encrypt: bool,
     pub pdf_a: bool,
+    pub pdf_ua: bool,
 }
 
 impl Default for Options {
@@ -169,7 +171,9 @@ impl Default for Options {
             page_text_location: PageTextLocation::BottomCenter,
             user_password: None,
             owner_password: None,
+            aes_encrypt: false,
             pdf_a: false,
+            pdf_ua: false,
         }
     }
 }
@@ -241,13 +245,29 @@ impl Options {
         self
     }
 
+    pub fn encrypt_aes(mut self, user_password: &str) -> Self {
+        self.user_password = Some(user_password.to_string());
+        self.aes_encrypt = true;
+        self
+    }
+
     pub fn owner_password(mut self, owner_password: &str) -> Self {
         self.owner_password = Some(owner_password.to_string());
         self
     }
 
+    pub fn aes(mut self) -> Self {
+        self.aes_encrypt = true;
+        self
+    }
+
     pub fn pdf_a(mut self) -> Self {
         self.pdf_a = true;
+        self
+    }
+
+    pub fn pdf_ua(mut self) -> Self {
+        self.pdf_ua = true;
         self
     }
 }

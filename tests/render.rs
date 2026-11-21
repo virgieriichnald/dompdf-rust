@@ -564,6 +564,20 @@ fn embeds_woff2_font() {
 }
 
 #[test]
+fn embeds_production_woff2_font() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let pdf = html2pdf_rs::render_html_with_base(
+        "<style>@font-face{font-family:DejaVu;src:url('DejaVuSans.woff2');}\
+         p{font-family:DejaVu}</style><p>Halo WOFF2 produksi</p>",
+        &base,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/FontFile2"), "missing embedded font");
+    assert!(raw.contains("Tj"), "missing text");
+}
+
+#[test]
 fn applies_media_rules_and_conditional_imports() {
     use std::fs;
 
@@ -725,6 +739,26 @@ fn text_matrices(raw: &str) -> Vec<(f32, f32)> {
         .collect()
 }
 
+fn background_image_transforms(raw: &str) -> Vec<[f32; 6]> {
+    raw.lines()
+        .filter(|line| line.trim_end().ends_with(" cm"))
+        .filter_map(|line| {
+            let values = line
+                .trim()
+                .trim_end_matches(" cm")
+                .split_whitespace()
+                .filter_map(|value| value.parse::<f32>().ok())
+                .collect::<Vec<_>>();
+            values.try_into().ok()
+        })
+        .filter(|values: &[f32; 6]| (values[0] - 20.0).abs() < 0.01)
+        .collect()
+}
+
+fn image_draw_count(raw: &str) -> usize {
+    raw.matches("/Im1 Do").count()
+}
+
 #[test]
 fn encrypts_pdf_with_standard_security() {
     let options = html2pdf_rs::Options::default().encrypt("secret");
@@ -742,6 +776,26 @@ fn encrypts_pdf_with_standard_security() {
 }
 
 #[test]
+fn encrypts_pdf_with_aes_128() {
+    let options = html2pdf_rs::Options::default().encrypt_aes("secret");
+    let pdf = html2pdf_rs::render_html_with_options(
+        "<p>Halaman terenkripsi AES</p>",
+        std::path::Path::new("."),
+        &options,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/V 4"), "missing AES revision");
+    assert!(raw.contains("/R 4"), "missing security revision 4");
+    assert!(raw.contains("/AESV2"), "missing AESV2 crypt filter");
+    assert!(raw.contains("/Length 128"), "wrong key length");
+    assert!(
+        raw.contains("/EncryptMetadata true"),
+        "missing metadata flag"
+    );
+}
+
+#[test]
 fn writes_pdf_a_output_intent_and_metadata() {
     let options = html2pdf_rs::Options::default().pdf_a();
     let pdf = html2pdf_rs::render_html_with_options(
@@ -753,8 +807,22 @@ fn writes_pdf_a_output_intent_and_metadata() {
 
     assert!(raw.starts_with("%PDF-1.4"), "wrong PDF version");
     assert!(raw.contains("/GTS_PDFA1"), "missing PDF/A output intent");
+    assert!(
+        raw.contains("/DestOutputProfile"),
+        "missing ICC output profile"
+    );
+    assert!(raw.contains("/N 3"), "wrong ICC profile color space");
+    assert!(
+        raw.contains("/OutputIntents ["),
+        "missing catalog output intents"
+    );
     assert!(raw.contains("/Type /Metadata"), "missing XMP metadata");
     assert!(raw.contains("/Lang (id)"), "missing document language");
+    assert_eq!(
+        raw.matches("/Lang (id)").count(),
+        1,
+        "duplicate language entry"
+    );
 }
 
 #[test]
@@ -857,7 +925,8 @@ fn applies_rgba_alpha_to_text_background_and_border() {
 #[test]
 fn wraps_text_around_floats() {
     let pdf = html2pdf_rs::render_html(
-        "<div style='float:left'>F</div><p>AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH</p>",
+        "<div style='float:left;border:1pt solid black;padding:4pt'>FLOATING</div>\
+         <p>AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH</p>",
     );
     let raw = String::from_utf8_lossy(&pdf);
     let matrices = text_matrices(&raw);
@@ -877,6 +946,72 @@ fn positions_float_and_respects_clear() {
 
     assert!(matrices.len() >= 2);
     assert!(matrices[1].1 > matrices[0].1);
+}
+
+#[test]
+fn stacks_floats_on_the_same_side() {
+    let render = |floats: &str| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<style>.f {{ float: left; border: 1pt solid black }} \
+             .c {{ clear: left }}</style>{floats}<p class=\"c\">Setelah</p>"
+        ));
+        let raw = String::from_utf8_lossy(&pdf);
+        text_matrices(&raw)
+            .into_iter()
+            .map(|matrix| matrix.1)
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    let one = render("<div class=\"f\">Satu</div>");
+    let two = render("<div class=\"f\">Satu</div><div class=\"f\">Dua</div>");
+    assert!(two < one - 10.0);
+}
+
+#[test]
+fn floats_respect_horizontal_margins() {
+    let render = |margin: u32| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<style>.f {{ float: left; margin-right: {margin}pt }}</style>\
+             <div class=\"f\">F</div><p>Teks</p>"
+        ));
+        text_matrices(&String::from_utf8_lossy(&pdf))
+            .into_iter()
+            .map(|matrix| matrix.0)
+            .fold(0.0f32, f32::max)
+    };
+
+    let narrow = render(0);
+    let wide = render(80);
+    assert!(wide > narrow + 60.0, "narrow={narrow} wide={wide}");
+}
+
+#[test]
+fn clear_respects_float_bottom_margin() {
+    let render = |margin: u32| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<style>.f {{ float: left; margin-bottom: {margin}pt }} \
+             .c {{ clear: left }}</style><div class=\"f\">F</div><p class=\"c\">Setelah</p>"
+        ));
+        text_matrices(&String::from_utf8_lossy(&pdf))
+            .into_iter()
+            .map(|matrix| matrix.1)
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    let tight = render(0);
+    let roomy = render(60);
+    assert!(roomy < tight - 45.0, "tight={tight} roomy={roomy}");
+}
+
+#[test]
+fn absolute_overlay_uses_full_available_width() {
+    let text = "A".repeat(90);
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<div style=\"position:absolute;left:0;top:0\">{text}</div>"
+    ));
+    let matrices = text_matrices(&String::from_utf8_lossy(&pdf));
+
+    assert_eq!(matrices.len(), 1, "matrices={matrices:?}");
 }
 
 #[test]
@@ -952,6 +1087,103 @@ fn positions_background_image_from_right_top() {
 }
 
 #[test]
+fn background_repeat_x_and_y_tile_only_requested_axis() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let render = |repeat: &str| {
+        let raw = html2pdf_rs::render_html(&format!(
+            "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+             background-size: 20pt 20pt; background-repeat: {repeat}; \
+             line-height: 60pt }}</style><div>Latar</div>"
+        ));
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    let none = render("no-repeat");
+    assert_eq!(image_draw_count(&none), 1);
+
+    let repeat_x = render("repeat-x");
+    let x_tiles = background_image_transforms(&repeat_x);
+    assert!(x_tiles.len() > 1);
+    assert!(x_tiles.iter().all(|values| (values[3] - 20.0).abs() < 0.01));
+
+    let repeat_y = render("repeat-y");
+    let y_tiles = background_image_transforms(&repeat_y);
+    assert!(y_tiles.len() > 1);
+    let first_x = y_tiles[0][4];
+    assert!(
+        y_tiles
+            .iter()
+            .all(|values| (values[4] - first_x).abs() < 0.01)
+    );
+}
+
+#[test]
+fn background_position_allows_negative_lengths() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let render = |position: &str| {
+        let raw = html2pdf_rs::render_html(&format!(
+            "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+             background-size: 20pt 20pt; background-repeat: no-repeat; \
+             background-position: {position} }}</style><div>Latar</div>"
+        ));
+        background_image_transforms(&String::from_utf8_lossy(&raw))
+            .into_iter()
+            .map(|values| values[4])
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    let negative_x = render("-10pt 0");
+    let positive_x = render("10pt 0");
+    assert!((positive_x - negative_x - 20.0).abs() < 0.5);
+}
+
+#[test]
+fn background_size_one_value_preserves_aspect_ratio() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [
+        255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0, 255, 255, 255, 0,
+    ];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 4, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let render = |size: &str| {
+        let raw = html2pdf_rs::render_html(&format!(
+            "<style>div {{ background-image: url(data:image/png;base64,{encoded}); \
+             background-repeat: no-repeat; background-size: {size} }}</style><div>Latar</div>"
+        ));
+        background_image_transforms(&String::from_utf8_lossy(&raw))[0]
+    };
+
+    let width_only = render("20pt");
+    assert!((width_only[0] - 20.0).abs() < 0.01);
+    assert!((width_only[3] - 10.0).abs() < 0.01);
+
+    let height_only = render("auto 10pt");
+    assert!((height_only[0] - 20.0).abs() < 0.01);
+    assert!((height_only[3] - 10.0).abs() < 0.01);
+}
+
+#[test]
 fn renders_hierarchical_bookmarks_from_headings() {
     let pdf = html2pdf_rs::render_html(
         "<h1>Bab Satu</h1><p>Isi</p><h2>Bagian A</h2><p>A</p>\
@@ -1001,6 +1233,19 @@ fn supports_counter_set() {
     let raw = String::from_utf8_lossy(&pdf);
 
     assert!(raw.contains("(6)"));
+}
+
+#[test]
+fn supports_multiple_counters_per_declaration() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>body { counter-reset: a 1 b 7 }\
+         p { counter-increment: a b 2 }\
+         p::before { content: counter(a) '-' counter(b) }</style>\
+         <p>A</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("(2-9)"), "missing multiple counter values");
 }
 
 #[test]
@@ -1126,6 +1371,8 @@ fn renders_acroform_fields() {
     assert!(raw.contains("/T (ok)"));
     assert!(raw.contains("/V (Halo)"));
     assert!(raw.contains("/Opt [(Jakarta) (Bandung)]"));
+    assert!(raw.contains("/AP <<"));
+    assert!(raw.contains("/Subtype /Form"));
 }
 
 #[test]

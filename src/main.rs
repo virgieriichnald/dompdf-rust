@@ -22,8 +22,10 @@ fn help() {
         "  --page-text-location POS  top-left|top-center|top-right|bottom-left|bottom-center|bottom-right"
     );
     println!("  --encrypt PASSWORD  Encrypt output with RC4 40-bit standard security");
+    println!("  --aes-128       Use AES-128 encryption with --encrypt");
     println!("  --owner-password PASSWORD  Separate owner password");
     println!("  --pdf-a        Add basic PDF/A-1b output intent and XMP metadata");
+    println!("  --pdf-ua       Mark output as tagged PDF/UA-1");
     println!("  --help         Show this help");
 }
 
@@ -132,6 +134,7 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                 })?;
                 options = options.encrypt(&value);
             }
+            "--aes-128" => options = options.aes(),
             "--owner-password" => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
@@ -142,6 +145,7 @@ fn parse_args() -> io::Result<(Options, String, String)> {
                 options = options.owner_password(&value);
             }
             "--pdf-a" => options = options.pdf_a(),
+            "--pdf-ua" => options = options.pdf_ua(),
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

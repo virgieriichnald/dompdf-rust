@@ -299,9 +299,9 @@ pub struct Style {
     pub white_space: WhiteSpace,
     pub page_name: Option<String>,
     pub content: Option<String>,
-    pub counter_reset: Option<(String, i32)>,
-    pub counter_set: Option<(String, i32)>,
-    pub counter_increment: Option<(String, i32)>,
+    pub counter_reset: Vec<(String, i32)>,
+    pub counter_set: Vec<(String, i32)>,
+    pub counter_increment: Vec<(String, i32)>,
     pub position: Position,
     pub float: Float,
     pub clear: Clear,
@@ -360,9 +360,9 @@ impl Default for Style {
             white_space: WhiteSpace::Normal,
             page_name: None,
             content: None,
-            counter_reset: None,
-            counter_set: None,
-            counter_increment: None,
+            counter_reset: Vec::new(),
+            counter_set: Vec::new(),
+            counter_increment: Vec::new(),
             position: Position::Static,
             float: Float::None,
             clear: Clear::None,
@@ -487,6 +487,8 @@ pub enum Clear {
 pub enum BackgroundRepeat {
     Repeat,
     NoRepeat,
+    RepeatX,
+    RepeatY,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -494,7 +496,7 @@ pub enum BackgroundSize {
     Auto,
     Cover,
     Contain,
-    Dimensions(f32, f32),
+    Dimensions(Option<f32>, Option<f32>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1116,17 +1118,34 @@ fn clean_family(value: &str) -> Option<String> {
     }
 }
 
-fn parse_counter(value: &str, default: i32) -> Option<(String, i32)> {
-    let mut tokens = value.split_whitespace();
-    let name = tokens.next()?.trim_matches(['"', '\'']).to_string();
-    if name.is_empty() {
-        return None;
+fn parse_counters(value: &str, default: i32) -> Vec<(String, i32)> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
     }
-    let amount = tokens
-        .next()
-        .and_then(|token| token.parse::<i32>().ok())
-        .unwrap_or(default);
-    Some((name, amount))
+    let tokens: Vec<_> = value
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut counters = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let name = tokens[index].trim_matches(['"', '\'']);
+        if name.is_empty() {
+            index += 1;
+            continue;
+        }
+        let mut amount = default;
+        if let Some(next) = tokens.get(index + 1)
+            && let Ok(parsed) = next.parse::<i32>()
+        {
+            amount = parsed;
+            index += 2;
+        } else {
+            index += 1;
+        }
+        counters.push((name.to_string(), amount));
+    }
+    counters
 }
 
 fn extract_url(value: &str) -> Option<String> {
@@ -1798,9 +1817,9 @@ fn apply_style_declarations(
                     style.content = Some(value.trim().to_string());
                 }
             }
-            "counter-reset" => style.counter_reset = parse_counter(value, 0),
-            "counter-set" => style.counter_set = parse_counter(value, 0),
-            "counter-increment" => style.counter_increment = parse_counter(value, 1),
+            "counter-reset" => style.counter_reset = parse_counters(value, 0),
+            "counter-set" => style.counter_set = parse_counters(value, 0),
+            "counter-increment" => style.counter_increment = parse_counters(value, 1),
             "font-family" => {
                 if let Some(family) = clean_family(value) {
                     style.font_family = family;
@@ -1824,11 +1843,7 @@ fn apply_style_declarations(
                 };
             }
             "background-repeat" => {
-                style.background_repeat = if value.to_ascii_lowercase().contains("no-repeat") {
-                    BackgroundRepeat::NoRepeat
-                } else {
-                    BackgroundRepeat::Repeat
-                };
+                style.background_repeat = parse_background_repeat(value);
             }
             "background-size" => {
                 if let Some(size) =
@@ -1923,8 +1938,13 @@ fn apply_style_declarations(
                     style.background_alpha = parse_color_alpha(value).unwrap_or(1.0);
                 }
                 style.background_image = extract_url(value);
-                if value.to_ascii_lowercase().contains("no-repeat") {
-                    style.background_repeat = BackgroundRepeat::NoRepeat;
+                for token in value.split_whitespace() {
+                    match token.to_ascii_lowercase().as_str() {
+                        "repeat" | "repeat-x" | "repeat-y" | "no-repeat" => {
+                            style.background_repeat = parse_background_repeat(token);
+                        }
+                        _ => {}
+                    }
                 }
                 if value.contains("cover") {
                     style.background_size = BackgroundSize::Cover;
@@ -2285,6 +2305,15 @@ fn parse_box_shorthand_resolved(
     }
 }
 
+fn parse_background_repeat(input: &str) -> BackgroundRepeat {
+    match input.trim().to_ascii_lowercase().replace(' ', "-").as_str() {
+        "no-repeat" => BackgroundRepeat::NoRepeat,
+        "repeat-x" => BackgroundRepeat::RepeatX,
+        "repeat-y" => BackgroundRepeat::RepeatY,
+        _ => BackgroundRepeat::Repeat,
+    }
+}
+
 fn parse_background_size(
     input: &str,
     font_size: f32,
@@ -2292,6 +2321,9 @@ fn parse_background_size(
     scale: f32,
 ) -> Option<BackgroundSize> {
     let lower = input.trim().to_ascii_lowercase();
+    if lower == "auto" {
+        return Some(BackgroundSize::Auto);
+    }
     if lower == "cover" {
         return Some(BackgroundSize::Cover);
     }
@@ -2299,21 +2331,29 @@ fn parse_background_size(
         return Some(BackgroundSize::Contain);
     }
 
-    let values = tokenize_lengths(input)
-        .iter()
-        .map(|token| {
-            parse_length_resolved(token, font_size, containing_width, scale).map(|length| {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+    let parse_dimension = |token: &str| {
+        if token.eq_ignore_ascii_case("auto") {
+            return Some(None);
+        }
+        parse_length_resolved(token, font_size, containing_width, scale)
+            .map(|length| {
                 length
                     .resolve_with_size(font_size, containing_width, scale)
                     .max(0.0)
             })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    match values.len() {
-        1 => Some(BackgroundSize::Dimensions(values[0], values[0])),
-        2 => Some(BackgroundSize::Dimensions(values[0], values[1])),
-        _ => None,
-    }
+            .map(Some)
+    };
+    let width = parse_dimension(tokens[0])?;
+    let height = if let Some(token) = tokens.get(1) {
+        parse_dimension(token)?
+    } else {
+        None
+    };
+    Some(BackgroundSize::Dimensions(width, height))
 }
 
 fn parse_border_radius(

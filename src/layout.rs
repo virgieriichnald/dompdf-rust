@@ -346,7 +346,9 @@ pub struct Document {
     pub page_text_location: PageTextLocation,
     pub user_password: Option<String>,
     pub owner_password: Option<String>,
+    pub aes_encrypt: bool,
     pub pdf_a: bool,
+    pub pdf_ua: bool,
     pub px_scale: f32,
 }
 
@@ -417,6 +419,10 @@ impl Document {
             page_rules,
             counter_styles.clone(),
         );
+        collector.pdf_a = options.pdf_a || options.pdf_ua;
+        if collector.pdf_a {
+            collector.load_pdf_a_fonts();
+        }
         let initial_geometry = collector.geometry_for(0);
         collector.pages[0].geometry = initial_geometry;
         collector.apply_geometry(initial_geometry);
@@ -442,7 +448,9 @@ impl Document {
             page_text_location: options.page_text_location,
             user_password: options.user_password.clone(),
             owner_password: options.owner_password.clone(),
+            aes_encrypt: options.aes_encrypt,
             pdf_a: options.pdf_a,
+            pdf_ua: options.pdf_ua,
             px_scale: base_style.px_scale,
         }
     }
@@ -743,6 +751,10 @@ struct FloatRect {
     width: f32,
     top: f32,
     bottom: f32,
+    margin_left: f32,
+    margin_right: f32,
+    margin_top: f32,
+    margin_bottom: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -793,6 +805,7 @@ struct Collector {
     px_scale: f32,
     image_byte_limit: Option<usize>,
     policy: ResourcePolicy,
+    pdf_a: bool,
 }
 
 impl Collector {
@@ -852,6 +865,7 @@ impl Collector {
             px_scale,
             image_byte_limit,
             policy,
+            pdf_a: false,
         }
     }
 
@@ -992,11 +1006,13 @@ impl Collector {
         self.flush_line();
         self.style_stack.push(self.block.clone());
         let mut reset_names = Vec::new();
-        if let Some((name, value)) = &style.counter_reset {
+        for (name, value) in &style.counter_reset {
             self.counters.entry(name.clone()).or_default().push(*value);
-            reset_names.push(name.clone());
+            if !reset_names.contains(name) {
+                reset_names.push(name.clone());
+            }
         }
-        if let Some((name, value)) = &style.counter_set {
+        for (name, value) in &style.counter_set {
             let values = self.counters.entry(name.clone()).or_default();
             if let Some(last) = values.last_mut() {
                 *last = *value;
@@ -1107,6 +1123,15 @@ impl Collector {
                     .iter()
                     .position(|font| font.family.eq_ignore_ascii_case(&family))
             })
+            .or_else(|| {
+                if self.pdf_a {
+                    self.fonts
+                        .iter()
+                        .position(|font| font.bold == bold && font.italic == italic)
+                } else {
+                    None
+                }
+            })
             .map(FontId::Embedded)
             .unwrap_or(FontId::Builtin(kind))
     }
@@ -1126,13 +1151,15 @@ impl Collector {
         let mut left = 0.0f32;
         let mut right = self.max_width;
         for float in &self.floats {
-            if top < float.bottom && top + line_height > float.top {
+            if top < float.bottom + float.margin_bottom
+                && top + line_height > float.top - float.margin_top
+            {
                 match float.side {
                     Float::Left => {
-                        left = left.max(float.left + float.width - base_left);
+                        left = left.max(float.left + float.width + float.margin_right - base_left);
                     }
                     Float::Right => {
-                        right = right.min(float.left - base_left);
+                        right = right.min(float.left - float.margin_left - base_left);
                     }
                     Float::None => {}
                 }
@@ -1325,6 +1352,14 @@ impl Collector {
             .height
             .max(height)
             .max(style.font_size * style.line_height);
+    }
+
+    fn load_pdf_a_fonts(&mut self) {
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            if let Some(font) = load_pdf_a_font(bold, italic) {
+                self.fonts.push(font);
+            }
+        }
     }
 
     fn load_fonts(&mut self, faces: &[FontFace]) {
@@ -2096,6 +2131,12 @@ mod tag {
     pub const HEAD: u32 = u32::from_be_bytes(*b"head");
 }
 
+const PDFA_FONT_BYTES: &[u8] = include_bytes!("../../lib/fonts/DejaVuSans.ttf");
+
+pub(crate) fn load_pdf_a_font(bold: bool, italic: bool) -> Option<EmbeddedFont> {
+    load_font("DejaVuSans", PDFA_FONT_BYTES, bold, italic)
+}
+
 fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<EmbeddedFont> {
     let font_bytes = decode_font_bytes(bytes)?;
     let face = Face::parse(&font_bytes, 0).ok()?;
@@ -2103,7 +2144,7 @@ fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<Emb
     let mut advance = HashMap::new();
     let mut glyphs = HashMap::new();
 
-    for code in 0x20u32..=0x2ff {
+    for code in (0x20u32..=0x2ff).chain([0x25cf, 0x2713]) {
         let Some(ch) = char::from_u32(code) else {
             continue;
         };
@@ -2310,7 +2351,7 @@ fn format_counter_value(value: i32, name: &str, styles: &[CounterStyle]) -> Stri
 }
 
 fn increment_counter(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
-    if let Some((name, delta)) = &style.counter_increment {
+    for (name, delta) in &style.counter_increment {
         let values = counters.entry(name.clone()).or_insert_with(|| vec![0]);
         if let Some(last) = values.last_mut() {
             *last += delta;
@@ -2321,14 +2362,14 @@ fn increment_counter(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
 }
 
 fn apply_counter_style(counters: &mut HashMap<String, Vec<i32>>, style: &Style) {
-    if let Some((name, value)) = &style.counter_reset {
+    for (name, value) in &style.counter_reset {
         if let Some(values) = counters.get_mut(name) {
             values.push(*value);
         } else {
             counters.insert(name.clone(), vec![*value]);
         }
     }
-    if let Some((name, value)) = &style.counter_set {
+    for (name, value) in &style.counter_set {
         let values = counters.entry(name.clone()).or_default();
         if let Some(last) = values.last_mut() {
             *last = *value;
@@ -2524,18 +2565,23 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
 
     if style.clear != Clear::None {
         collector.flush_line();
-        let bottom = match style.clear {
-            Clear::Left => collector.float_left_bottom,
-            Clear::Right => collector.float_right_bottom,
-            Clear::Both => collector
-                .float_left_bottom
-                .max(collector.float_right_bottom),
-            Clear::None => 0.0,
+        let cursor = collector.cursor;
+        let matches = |float: &FloatRect| match style.clear {
+            Clear::Left => float.side == Float::Left,
+            Clear::Right => float.side == Float::Right,
+            Clear::Both => float.side != Float::None,
+            Clear::None => false,
         };
-        collector.cursor = collector.cursor.max(bottom);
+        let bottom = collector
+            .floats
+            .iter()
+            .filter(|float| matches(float))
+            .map(|float| float.bottom + float.margin_bottom)
+            .fold(cursor, f32::max);
+        collector.cursor = bottom;
         collector
             .floats
-            .retain(|float| float.bottom > collector.cursor);
+            .retain(|float| float.bottom + float.margin_bottom > collector.cursor);
     }
 
     if style.float != Float::None {
@@ -3106,7 +3152,7 @@ fn layout_overlay<'a>(
     let saved_anchors = collector.anchors.len();
     let saved_bookmarks = collector.bookmarks.len();
 
-    let content_width = (collector.max_width * 0.6).max(1.0);
+    let content_width = collector.max_width.max(1.0);
     collector.max_width = content_width;
     collector.page_height = f32::MAX;
     collector.cursor = 0.0;
@@ -3149,6 +3195,10 @@ fn layout_overlay<'a>(
     collector.pending_before = saved_pending;
     collector.block = saved_block;
 
+    let margin_left = style.margin_left_pt();
+    let margin_right = style.margin_right_pt();
+    let margin_top = style.margin_top_pt();
+    let margin_bottom = style.margin_bottom_pt();
     let padding_left = style.padding_left_pt();
     let padding_right = style.padding_right_pt();
     let padding_top = style.padding_top_pt();
@@ -3158,8 +3208,9 @@ fn layout_overlay<'a>(
         .iter()
         .map(|line| line.space_before + line.height + line.space_after)
         .sum::<f32>();
-    let box_width = (text_width + padding_left + padding_right).max(54.0);
-    let box_height = (content_height + padding_top + padding_bottom).max(18.0);
+    let available_width = (saved_max - margin_left - margin_right).max(1.0);
+    let box_width = (text_width + padding_left + padding_right).clamp(1.0, available_width);
+    let box_height = (content_height + padding_top + padding_bottom).max(1.0);
 
     let resolve = |value: Option<Length>| {
         value
@@ -3167,13 +3218,23 @@ fn layout_overlay<'a>(
             .unwrap_or(0.0)
     };
     let (x, y) = if let Some(side) = float {
+        let stacked_top = collector
+            .floats
+            .iter()
+            .filter(|existing| {
+                existing.side == side
+                    && saved_cursor + margin_top < existing.bottom + existing.margin_bottom
+                    && saved_cursor + margin_top + box_height > existing.top - existing.margin_top
+            })
+            .map(|existing| existing.bottom + existing.margin_bottom)
+            .fold(saved_cursor + margin_top, f32::max);
         (
             if side == Float::Left {
-                0.0
+                margin_left
             } else {
-                saved_max - box_width
+                saved_max - margin_right - box_width
             },
-            saved_cursor,
+            stacked_top,
         )
     } else {
         let x = if let Some(left) = style.offset_left {
@@ -3240,16 +3301,25 @@ fn layout_overlay<'a>(
 
     if let Some(side) = float {
         let bottom = y + box_height;
+        let occupied_bottom = bottom + margin_bottom;
         collector.floats.push(FloatRect {
             side,
             left: x,
             width: box_width,
             top: y,
             bottom,
+            margin_left,
+            margin_right,
+            margin_top,
+            margin_bottom,
         });
         match side {
-            Float::Left => collector.float_left_bottom = collector.float_left_bottom.max(bottom),
-            Float::Right => collector.float_right_bottom = collector.float_right_bottom.max(bottom),
+            Float::Left => {
+                collector.float_left_bottom = collector.float_left_bottom.max(occupied_bottom)
+            }
+            Float::Right => {
+                collector.float_right_bottom = collector.float_right_bottom.max(occupied_bottom)
+            }
             Float::None => {}
         }
     }

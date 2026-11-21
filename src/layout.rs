@@ -6,11 +6,11 @@ use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
 
 use crate::css::{
-    BackgroundRepeat, BackgroundSize, BorderCollapse, BorderSpec, Clear, CounterStyle,
-    CounterSystem, Display, Float, FontFace, Length, ListStyle, MediaContext, PageRules, Position,
-    PseudoElement, Rule, Style, TextAlign, VerticalAlign, WhiteSpace, parse_color,
-    parse_counter_styles, parse_font_faces, parse_length, parse_page_rules, parse_styles,
-    pseudo_style_for, px_scale, style_for,
+    BackgroundAttachment, BackgroundBox, BackgroundRepeat, BackgroundSize, BorderCollapse,
+    BorderSpec, Clear, CounterStyle, CounterSystem, Display, Float, FontFace, Length, ListStyle,
+    MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign, VerticalAlign,
+    WhiteSpace, parse_color, parse_counter_styles, parse_font_faces, parse_length,
+    parse_page_rules, parse_styles, pseudo_style_for, px_scale, style_for,
 };
 use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
@@ -212,11 +212,18 @@ struct BlockStyle {
     background_image: Option<usize>,
     background_repeat: BackgroundRepeat,
     background_size: BackgroundSize,
+    background_attachment: BackgroundAttachment,
+    background_clip: BackgroundBox,
+    background_origin: BackgroundBox,
     background_position_x: f32,
     background_position_y: f32,
     background_position_x_is_length: bool,
     background_position_y_is_length: bool,
     border: Option<BorderSpec>,
+    padding_top: f32,
+    padding_right: f32,
+    padding_bottom: f32,
+    padding_left: f32,
     opacity: f32,
     border_radius: [f32; 4],
 }
@@ -229,11 +236,18 @@ impl Default for BlockStyle {
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_attachment: BackgroundAttachment::Scroll,
+            background_clip: BackgroundBox::BorderBox,
+            background_origin: BackgroundBox::PaddingBox,
             background_position_x: 0.0,
             background_position_y: 0.0,
             background_position_x_is_length: false,
             background_position_y_is_length: false,
             border: None,
+            padding_top: 0.0,
+            padding_right: 0.0,
+            padding_bottom: 0.0,
+            padding_left: 0.0,
             opacity: 1.0,
             border_radius: [0.0; 4],
         }
@@ -267,12 +281,19 @@ pub struct Line {
     pub background_image: Option<usize>,
     pub background_repeat: BackgroundRepeat,
     pub background_size: BackgroundSize,
+    pub background_attachment: BackgroundAttachment,
+    pub background_clip: BackgroundBox,
+    pub background_origin: BackgroundBox,
     pub background_position_x: f32,
     pub background_position_y: f32,
     pub background_position_x_is_length: bool,
     pub background_position_y_is_length: bool,
     pub background_width: Option<f32>,
     pub border: Option<BorderSpec>,
+    pub padding_top: f32,
+    pub padding_right: f32,
+    pub padding_bottom: f32,
+    pub padding_left: f32,
     pub opacity: f32,
     pub border_radius: [f32; 4],
     pub links: Vec<LinkRect>,
@@ -915,10 +936,17 @@ impl Collector {
             line.background_image = self.block.background_image;
             line.background_repeat = self.block.background_repeat;
             line.background_size = self.block.background_size;
+            line.background_attachment = self.block.background_attachment;
+            line.background_clip = self.block.background_clip;
+            line.background_origin = self.block.background_origin;
             line.background_position_x = self.block.background_position_x;
             line.background_position_y = self.block.background_position_y;
             line.background_position_x_is_length = self.block.background_position_x_is_length;
             line.background_position_y_is_length = self.block.background_position_y_is_length;
+            line.padding_top = self.block.padding_top;
+            line.padding_right = self.block.padding_right;
+            line.padding_bottom = self.block.padding_bottom;
+            line.padding_left = self.block.padding_left;
         }
         if line.border.is_none() {
             line.border = self.block.border;
@@ -984,12 +1012,19 @@ impl Collector {
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_attachment: BackgroundAttachment::Scroll,
+            background_clip: BackgroundBox::BorderBox,
+            background_origin: BackgroundBox::PaddingBox,
             background_position_x: 0.0,
             background_position_y: 0.0,
             background_position_x_is_length: false,
             background_position_y_is_length: false,
             background_width: None,
             border: None,
+            padding_top: 0.0,
+            padding_right: 0.0,
+            padding_bottom: 0.0,
+            padding_left: 0.0,
             opacity: 1.0,
             border_radius: [0.0; 4],
             links: Vec::new(),
@@ -1055,10 +1090,17 @@ impl Collector {
         }
         self.block.background_repeat = style.background_repeat;
         self.block.background_size = style.background_size;
+        self.block.background_attachment = style.background_attachment;
+        self.block.background_clip = style.background_clip;
+        self.block.background_origin = style.background_origin;
         self.block.background_position_x = style.background_position_x;
         self.block.background_position_y = style.background_position_y;
         self.block.background_position_x_is_length = style.background_position_x_is_length;
         self.block.background_position_y_is_length = style.background_position_y_is_length;
+        self.block.padding_top = style.padding_top_pt();
+        self.block.padding_right = style.padding_right_pt();
+        self.block.padding_bottom = style.padding_bottom_pt();
+        self.block.padding_left = style.padding_left_pt();
         if style.border.is_some() {
             self.block.border = style.border;
         }
@@ -2830,7 +2872,9 @@ fn emit_prepared_row(
         let x = column_offset(widths, spacing, cell.column);
         let cell_width = cell_span_width(widths, spacing, cell.column, cell.colspan);
         let padding_left = cell.style.padding_left_pt();
+        let padding_right = cell.style.padding_right_pt();
         let padding_top = cell.style.padding_top_pt();
+        let padding_bottom = cell.style.padding_bottom_pt();
         let content_height = cell
             .lines
             .iter()
@@ -2862,12 +2906,19 @@ fn emit_prepared_row(
                 .and_then(|url| collector.load_image_index(url)),
             background_repeat: cell.style.background_repeat,
             background_size: cell.style.background_size,
+            background_attachment: cell.style.background_attachment,
+            background_clip: cell.style.background_clip,
+            background_origin: cell.style.background_origin,
             background_position_x: cell.style.background_position_x,
             background_position_y: cell.style.background_position_y,
             background_position_x_is_length: cell.style.background_position_x_is_length,
             background_position_y_is_length: cell.style.background_position_y_is_length,
             background_width: Some(cell_width),
             border: cell.style.border,
+            padding_top,
+            padding_right,
+            padding_bottom,
+            padding_left,
             opacity: cell.style.opacity,
             border_radius: cell.style.border_radius,
             links: Vec::new(),
@@ -3162,10 +3213,26 @@ fn layout_overlay<'a>(
     collector.block = BlockStyle {
         background: style.background,
         background_alpha: style.background_alpha,
+        background_image: style
+            .background_image
+            .as_deref()
+            .and_then(|url| collector.load_image_index(url)),
+        background_repeat: style.background_repeat,
+        background_size: style.background_size,
+        background_attachment: style.background_attachment,
+        background_clip: style.background_clip,
+        background_origin: style.background_origin,
+        background_position_x: style.background_position_x,
+        background_position_y: style.background_position_y,
+        background_position_x_is_length: style.background_position_x_is_length,
+        background_position_y_is_length: style.background_position_y_is_length,
         border: style.border,
+        padding_top: style.padding_top_pt(),
+        padding_right: style.padding_right_pt(),
+        padding_bottom: style.padding_bottom_pt(),
+        padding_left: style.padding_left_pt(),
         opacity: style.opacity,
         border_radius: style.border_radius,
-        ..BlockStyle::default()
     };
 
     for child in element.children() {
@@ -3276,12 +3343,19 @@ fn layout_overlay<'a>(
             background_image,
             background_repeat: style.background_repeat,
             background_size: style.background_size,
+            background_attachment: style.background_attachment,
+            background_clip: style.background_clip,
+            background_origin: style.background_origin,
             background_position_x: style.background_position_x,
             background_position_y: style.background_position_y,
             background_position_x_is_length: style.background_position_x_is_length,
             background_position_y_is_length: style.background_position_y_is_length,
             background_width: Some(box_width),
             border: style.border,
+            padding_top,
+            padding_right,
+            padding_bottom,
+            padding_left,
             opacity: style.opacity,
             border_radius: style.border_radius,
             links: Vec::new(),

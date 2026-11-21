@@ -278,6 +278,9 @@ pub struct Style {
     pub background_image: Option<String>,
     pub background_repeat: BackgroundRepeat,
     pub background_size: BackgroundSize,
+    pub background_attachment: BackgroundAttachment,
+    pub background_clip: BackgroundBox,
+    pub background_origin: BackgroundBox,
     pub background_position_x: f32,
     pub background_position_y: f32,
     pub background_position_x_is_length: bool,
@@ -339,6 +342,9 @@ impl Default for Style {
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_size: BackgroundSize::Auto,
+            background_attachment: BackgroundAttachment::Scroll,
+            background_clip: BackgroundBox::BorderBox,
+            background_origin: BackgroundBox::PaddingBox,
             background_position_x: 0.0,
             background_position_y: 0.0,
             background_position_x_is_length: false,
@@ -497,6 +503,20 @@ pub enum BackgroundSize {
     Cover,
     Contain,
     Dimensions(Option<f32>, Option<f32>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundBox {
+    BorderBox,
+    PaddingBox,
+    ContentBox,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundAttachment {
+    Scroll,
+    Fixed,
+    Local,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1852,6 +1872,21 @@ fn apply_style_declarations(
                     style.background_size = size;
                 }
             }
+            "background-attachment" => {
+                if let Some(attachment) = parse_background_attachment(value) {
+                    style.background_attachment = attachment;
+                }
+            }
+            "background-clip" => {
+                if let Some(background_box) = parse_background_box(value) {
+                    style.background_clip = background_box;
+                }
+            }
+            "background-origin" => {
+                if let Some(background_box) = parse_background_box(value) {
+                    style.background_origin = background_box;
+                }
+            }
             "background-position" => {
                 let tokens: Vec<_> = value.split_whitespace().collect();
                 let resolve = |token: &str, basis: f32| match token.to_ascii_lowercase().as_str() {
@@ -1938,13 +1973,31 @@ fn apply_style_declarations(
                     style.background_alpha = parse_color_alpha(value).unwrap_or(1.0);
                 }
                 style.background_image = extract_url(value);
+                let mut boxes = Vec::new();
                 for token in value.split_whitespace() {
-                    match token.to_ascii_lowercase().as_str() {
-                        "repeat" | "repeat-x" | "repeat-y" | "no-repeat" => {
-                            style.background_repeat = parse_background_repeat(token);
+                    if let Some(background_box) = parse_background_box(token) {
+                        boxes.push(background_box);
+                    } else if let Some(attachment) = parse_background_attachment(token) {
+                        style.background_attachment = attachment;
+                    } else {
+                        match token.to_ascii_lowercase().as_str() {
+                            "repeat" | "repeat-x" | "repeat-y" | "no-repeat" => {
+                                style.background_repeat = parse_background_repeat(token);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                }
+                match boxes.as_slice() {
+                    [background_box] => {
+                        style.background_origin = *background_box;
+                        style.background_clip = *background_box;
+                    }
+                    [origin, clip] => {
+                        style.background_origin = *origin;
+                        style.background_clip = *clip;
+                    }
+                    _ => {}
                 }
                 if value.contains("cover") {
                     style.background_size = BackgroundSize::Cover;
@@ -2301,6 +2354,24 @@ fn parse_box_shorthand_resolved(
         2 => Some([values[0], values[1], values[0], values[1]]),
         3 => Some([values[0], values[1], values[2], values[1]]),
         4 => Some([values[0], values[1], values[2], values[3]]),
+        _ => None,
+    }
+}
+
+fn parse_background_box(input: &str) -> Option<BackgroundBox> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "border-box" => Some(BackgroundBox::BorderBox),
+        "padding-box" => Some(BackgroundBox::PaddingBox),
+        "content-box" => Some(BackgroundBox::ContentBox),
+        _ => None,
+    }
+}
+
+fn parse_background_attachment(input: &str) -> Option<BackgroundAttachment> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "fixed" => Some(BackgroundAttachment::Fixed),
+        "local" => Some(BackgroundAttachment::Local),
+        "scroll" => Some(BackgroundAttachment::Scroll),
         _ => None,
     }
 }

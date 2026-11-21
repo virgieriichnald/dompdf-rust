@@ -739,6 +739,19 @@ fn text_matrices(raw: &str) -> Vec<(f32, f32)> {
         .collect()
 }
 
+fn pdf_rects(raw: &str) -> Vec<[f32; 4]> {
+    raw.match_indices(" re")
+        .filter_map(|(index, _)| {
+            let start = raw[..index].rfind('\n').map_or(0, |newline| newline + 1);
+            let values = raw[start..index]
+                .split_whitespace()
+                .filter_map(|value| value.parse::<f32>().ok())
+                .collect::<Vec<_>>();
+            values.try_into().ok()
+        })
+        .collect()
+}
+
 fn background_image_transforms(raw: &str) -> Vec<[f32; 6]> {
     raw.lines()
         .filter(|line| line.trim_end().ends_with(" cm"))
@@ -847,6 +860,76 @@ fn renders_background_image_with_opacity_and_radius() {
     assert!(raw.contains("/GS1"));
     assert!(raw.contains(" gs"));
     assert!(raw.contains("Im1 Do"));
+}
+
+#[test]
+fn background_clip_controls_background_color_extent() {
+    let render = |clip: &str| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<div style=\"background:red;background-clip:{clip};padding:10pt;\
+             border:5pt solid green;font-size:40pt;line-height:2\">x</div>"
+        ));
+        pdf_rects(&String::from_utf8_lossy(&pdf))[0]
+    };
+
+    let border = render("border-box");
+    let content = render("content-box");
+    assert!(content[0] > border[0] + 14.0, "border={border:?}");
+    assert!(content[2] < border[2] - 28.0, "content={content:?}");
+}
+
+#[test]
+fn background_origin_controls_image_placement() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut png = Vec::new();
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let render = |origin: &str| {
+        let pdf = html2pdf_rs::render_html(&format!(
+            "<div style=\"background-image:url(data:image/png;base64,{encoded});\
+             background-repeat:no-repeat;background-size:20pt 20pt;background-position:left top;\
+             background-origin:{origin};padding:10pt;border:5pt solid black;line-height:3\">x</div>"
+        ));
+        background_image_transforms(&String::from_utf8_lossy(&pdf))[0]
+    };
+
+    let padding = render("padding-box");
+    let content = render("content-box");
+    assert!(content[4] > padding[4] + 8.0, "padding={padding:?}");
+}
+
+#[test]
+fn parses_background_clip_origin_and_attachment() {
+    use html2pdf_rs::css::{
+        BackgroundAttachment, BackgroundBox, Style, apply_declarations, parse_declarations,
+    };
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "background-clip:content-box;background-origin:border-box;background-attachment:fixed",
+        ),
+        12.0,
+    );
+    assert_eq!(style.background_clip, BackgroundBox::ContentBox);
+    assert_eq!(style.background_origin, BackgroundBox::BorderBox);
+    assert_eq!(style.background_attachment, BackgroundAttachment::Fixed);
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("background:padding-box content-box red local"),
+        12.0,
+    );
+    assert_eq!(style.background_origin, BackgroundBox::PaddingBox);
+    assert_eq!(style.background_clip, BackgroundBox::ContentBox);
+    assert_eq!(style.background_attachment, BackgroundAttachment::Local);
 }
 
 #[test]

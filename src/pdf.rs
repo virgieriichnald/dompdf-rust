@@ -9,10 +9,12 @@ use pdf_writer::writers::{Action, StructTreeRoot};
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 use rand::RngCore;
 
-use crate::css::{BackgroundRepeat, BackgroundSize, TextAlign};
+use crate::css::{
+    BackgroundAttachment, BackgroundBox, BackgroundRepeat, BackgroundSize, TextAlign,
+};
 use crate::layout::{
-    Document, FontId, FontKind, FormControl, InlineItem, Page, StructureRole, load_pdf_a_font,
-    measure,
+    Document, FontId, FontKind, FormControl, InlineItem, Line, Page, StructureRole,
+    load_pdf_a_font, measure,
 };
 
 #[derive(Clone, Copy)]
@@ -1074,6 +1076,55 @@ fn absolute_background_offset(value: f32, _available: f32) -> f32 {
     value
 }
 
+fn background_box_rect(
+    line: &Line,
+    target: BackgroundBox,
+    left: f32,
+    bottom: f32,
+    width: f32,
+    height: f32,
+) -> (f32, f32, f32, f32) {
+    if target == BackgroundBox::BorderBox {
+        return (left, bottom, width, height);
+    }
+
+    let border_width = line.border.map(|border| border.width).unwrap_or(0.0);
+    let mut inset_left = if line.border.is_some_and(|border| border.left) {
+        border_width
+    } else {
+        0.0
+    };
+    let mut inset_right = if line.border.is_some_and(|border| border.right) {
+        border_width
+    } else {
+        0.0
+    };
+    let mut inset_bottom = if line.border.is_some_and(|border| border.bottom) {
+        border_width
+    } else {
+        0.0
+    };
+    let mut inset_top = if line.border.is_some_and(|border| border.top) {
+        border_width
+    } else {
+        0.0
+    };
+
+    if target == BackgroundBox::ContentBox {
+        inset_left += line.padding_left;
+        inset_right += line.padding_right;
+        inset_bottom += line.padding_bottom;
+        inset_top += line.padding_top;
+    }
+
+    (
+        left + inset_left,
+        bottom + inset_bottom,
+        (width - inset_left - inset_right).max(0.0),
+        (height - inset_bottom - inset_top).max(0.0),
+    )
+}
+
 fn rounded_rect_path(
     content: &mut Content,
     x: f32,
@@ -1218,6 +1269,33 @@ fn build_content(
         } + line.left;
         let line_y = height - margin - line.top - line.height;
         let line_width = line.background_width.unwrap_or(line.width);
+        let border_left = margin + line.left;
+        let (clip_left, clip_bottom, clip_width, clip_height) = background_box_rect(
+            line,
+            line.background_clip,
+            border_left,
+            line_y,
+            line_width,
+            line.height,
+        );
+        let (origin_left, origin_bottom, origin_width, origin_height) =
+            if line.background_attachment == BackgroundAttachment::Fixed {
+                (
+                    margin,
+                    margin,
+                    (width - 2.0 * margin).max(0.0),
+                    (height - 2.0 * margin).max(0.0),
+                )
+            } else {
+                background_box_rect(
+                    line,
+                    line.background_origin,
+                    border_left,
+                    line_y,
+                    line_width,
+                    line.height,
+                )
+            };
 
         if let Some(index) = line.background_image
             && let Some(asset) = document.images.get(index)
@@ -1257,10 +1335,10 @@ fn build_content(
                 content.save_state();
                 rounded_rect_path(
                     &mut content,
-                    margin + line.left,
-                    line_y,
-                    line_width,
-                    line.height,
+                    clip_left,
+                    clip_bottom,
+                    clip_width,
+                    clip_height,
                     line.border_radius,
                 );
                 content.clip_nonzero();
@@ -1273,10 +1351,10 @@ fn build_content(
                     line.background_repeat,
                     BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY
                 );
-                let left_edge = margin + line.left;
-                let right_edge = left_edge + line_width;
-                let available_x = (line_width - tile_width).max(0.0);
-                let available_y = (line.height - tile_height).max(0.0);
+                let right_edge = clip_left + clip_width;
+                let clip_top = clip_bottom + clip_height;
+                let available_x = (origin_width - tile_width).max(0.0);
+                let available_y = (origin_height - tile_height).max(0.0);
                 let pos_x = if line.background_position_x_is_length {
                     absolute_background_offset(line.background_position_x, available_x)
                 } else {
@@ -1287,23 +1365,23 @@ fn build_content(
                 } else {
                     line.background_position_y * available_y
                 };
-                let start_top = line_y + line.height - pos_y;
+                let start_top = origin_bottom + origin_height - pos_y;
                 let mut bottom = start_top - tile_height;
                 loop {
-                    let mut x_tile = left_edge + pos_x;
+                    let mut x_tile = origin_left + pos_x;
                     if repeat_x {
-                        while x_tile > left_edge {
+                        while x_tile > clip_left {
                             x_tile -= tile_width;
                         }
-                        while x_tile + tile_width < left_edge {
+                        while x_tile + tile_width < clip_left {
                             x_tile += tile_width;
                         }
                     }
                     loop {
-                        if x_tile + tile_width > left_edge
+                        if x_tile + tile_width > clip_left
                             && x_tile < right_edge
-                            && bottom + tile_height > line_y
-                            && bottom < line_y + line.height
+                            && bottom + tile_height > clip_bottom
+                            && bottom < clip_top
                         {
                             content
                                 .transform([tile_width, 0.0, 0.0, tile_height, x_tile, bottom])
@@ -1321,7 +1399,7 @@ fn build_content(
                         break;
                     }
                     bottom -= tile_height;
-                    if bottom + tile_height <= line_y {
+                    if bottom + tile_height <= clip_bottom {
                         break;
                     }
                 }
@@ -1342,10 +1420,10 @@ fn build_content(
             content.set_fill_rgb(color[0], color[1], color[2]);
             rounded_rect_path(
                 &mut content,
-                margin + line.left,
-                line_y,
-                line_width,
-                line.height,
+                clip_left,
+                clip_bottom,
+                clip_width,
+                clip_height,
                 line.border_radius,
             );
             content.fill_nonzero();

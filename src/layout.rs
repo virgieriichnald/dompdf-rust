@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use scraper::{ElementRef, Html, Selector};
 use ttf_parser::Face;
@@ -10,45 +11,341 @@ use crate::css::{
     BorderSpec, BorderStyle, BreakInside, Clear, CounterStyle, CounterSystem, Display, Float,
     FontFace, Length, ListStyle, MediaContext, OutlineSpec, PageBreak, PageRules, Position,
     PseudoElement, Rule, Style, TextAlign, TextTransform, VerticalAlign, WhiteSpace, WordBreak,
-    parse_color, parse_counter_styles, parse_font_faces, parse_length, parse_page_rules,
-    parse_styles, pseudo_style_for, px_scale, style_for,
+    parse_counter_styles, parse_font_faces, parse_length, parse_page_rules, parse_styles,
+    pseudo_style_for, px_scale, style_for,
 };
 use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
-const HELVETICA_WIDTHS: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
-    556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
-    611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
-    667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
-    222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
-];
+const AFM_HELVETICA_REGULAR: &str = include_str!("../../lib/fonts/Helvetica.afm");
+const AFM_HELVETICA_BOLD: &str = include_str!("../../lib/fonts/Helvetica-Bold.afm");
+const AFM_HELVETICA_OBLIQUE: &str = include_str!("../../lib/fonts/Helvetica-Oblique.afm");
+const AFM_HELVETICA_BOLD_OBLIQUE: &str = include_str!("../../lib/fonts/Helvetica-BoldOblique.afm");
+const AFM_TIMES_REGULAR: &str = include_str!("../../lib/fonts/Times-Roman.afm");
+const AFM_TIMES_BOLD: &str = include_str!("../../lib/fonts/Times-Bold.afm");
+const AFM_TIMES_OBLIQUE: &str = include_str!("../../lib/fonts/Times-Italic.afm");
+const AFM_TIMES_BOLD_OBLIQUE: &str = include_str!("../../lib/fonts/Times-BoldItalic.afm");
+const AFM_COURIER_REGULAR: &str = include_str!("../../lib/fonts/Courier.afm");
+const AFM_COURIER_BOLD: &str = include_str!("../../lib/fonts/Courier-Bold.afm");
+const AFM_COURIER_OBLIQUE: &str = include_str!("../../lib/fonts/Courier-Oblique.afm");
+const AFM_COURIER_BOLD_OBLIQUE: &str = include_str!("../../lib/fonts/Courier-BoldOblique.afm");
+const AFM_SYMBOL: &str = include_str!("../../lib/fonts/Symbol.afm");
+const AFM_ZAPF_DINGBATS: &str = include_str!("../../lib/fonts/ZapfDingbats.afm");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinFamily {
+    Helvetica,
+    Times,
+    Courier,
+    Symbol,
+    ZapfDingbats,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontKind {
-    Regular,
-    Bold,
-    Oblique,
-    BoldOblique,
+    HelveticaRegular,
+    HelveticaBold,
+    HelveticaOblique,
+    HelveticaBoldOblique,
+    TimesRegular,
+    TimesBold,
+    TimesOblique,
+    TimesBoldOblique,
+    CourierRegular,
+    CourierBold,
+    CourierOblique,
+    CourierBoldOblique,
+    Symbol,
+    ZapfDingbats,
 }
 
 impl FontKind {
+    pub fn all() -> [Self; 14] {
+        [
+            Self::HelveticaRegular,
+            Self::HelveticaBold,
+            Self::HelveticaOblique,
+            Self::HelveticaBoldOblique,
+            Self::TimesRegular,
+            Self::TimesBold,
+            Self::TimesOblique,
+            Self::TimesBoldOblique,
+            Self::CourierRegular,
+            Self::CourierBold,
+            Self::CourierOblique,
+            Self::CourierBoldOblique,
+            Self::Symbol,
+            Self::ZapfDingbats,
+        ]
+    }
+
     pub fn from_style(style: &Style) -> Self {
-        match (style.bold, style.italic) {
-            (true, true) => Self::BoldOblique,
-            (true, false) => Self::Bold,
-            (false, true) => Self::Oblique,
-            (false, false) => Self::Regular,
+        let family = style
+            .font_family
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'')
+            .to_ascii_lowercase();
+        let family = match family.as_str() {
+            "times" | "times roman" | "times-new-roman" | "times new roman" | "serif" => {
+                BuiltinFamily::Times
+            }
+            "courier" | "courier new" | "courier-new" | "monospace" => BuiltinFamily::Courier,
+            "symbol" => BuiltinFamily::Symbol,
+            "zapf dingbats" | "zapf-dingbats" | "dingbats" => BuiltinFamily::ZapfDingbats,
+            _ => BuiltinFamily::Helvetica,
+        };
+        match family {
+            BuiltinFamily::Symbol => Self::Symbol,
+            BuiltinFamily::ZapfDingbats => Self::ZapfDingbats,
+            BuiltinFamily::Helvetica => match (style.bold, style.italic) {
+                (true, true) => Self::HelveticaBoldOblique,
+                (true, false) => Self::HelveticaBold,
+                (false, true) => Self::HelveticaOblique,
+                (false, false) => Self::HelveticaRegular,
+            },
+            BuiltinFamily::Times => match (style.bold, style.italic) {
+                (true, true) => Self::TimesBoldOblique,
+                (true, false) => Self::TimesBold,
+                (false, true) => Self::TimesOblique,
+                (false, false) => Self::TimesRegular,
+            },
+            BuiltinFamily::Courier => match (style.bold, style.italic) {
+                (true, true) => Self::CourierBoldOblique,
+                (true, false) => Self::CourierBold,
+                (false, true) => Self::CourierOblique,
+                (false, false) => Self::CourierRegular,
+            },
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::HelveticaRegular => 0,
+            Self::HelveticaBold => 1,
+            Self::HelveticaOblique => 2,
+            Self::HelveticaBoldOblique => 3,
+            Self::TimesRegular => 4,
+            Self::TimesBold => 5,
+            Self::TimesOblique => 6,
+            Self::TimesBoldOblique => 7,
+            Self::CourierRegular => 8,
+            Self::CourierBold => 9,
+            Self::CourierOblique => 10,
+            Self::CourierBoldOblique => 11,
+            Self::Symbol => 12,
+            Self::ZapfDingbats => 13,
+        }
+    }
+
+    fn family(self) -> BuiltinFamily {
+        match self {
+            Self::HelveticaRegular
+            | Self::HelveticaBold
+            | Self::HelveticaOblique
+            | Self::HelveticaBoldOblique => BuiltinFamily::Helvetica,
+            Self::TimesRegular | Self::TimesBold | Self::TimesOblique | Self::TimesBoldOblique => {
+                BuiltinFamily::Times
+            }
+            Self::CourierRegular
+            | Self::CourierBold
+            | Self::CourierOblique
+            | Self::CourierBoldOblique => BuiltinFamily::Courier,
+            Self::Symbol => BuiltinFamily::Symbol,
+            Self::ZapfDingbats => BuiltinFamily::ZapfDingbats,
+        }
+    }
+
+    pub fn is_font_specific(self) -> bool {
+        matches!(
+            self.family(),
+            BuiltinFamily::Symbol | BuiltinFamily::ZapfDingbats
+        )
+    }
+
+    pub fn base_font_name(self) -> &'static [u8] {
+        match self {
+            Self::HelveticaRegular => b"Helvetica",
+            Self::HelveticaBold => b"Helvetica-Bold",
+            Self::HelveticaOblique => b"Helvetica-Oblique",
+            Self::HelveticaBoldOblique => b"Helvetica-BoldOblique",
+            Self::TimesRegular => b"Times-Roman",
+            Self::TimesBold => b"Times-Bold",
+            Self::TimesOblique => b"Times-Italic",
+            Self::TimesBoldOblique => b"Times-BoldItalic",
+            Self::CourierRegular => b"Courier",
+            Self::CourierBold => b"Courier-Bold",
+            Self::CourierOblique => b"Courier-Oblique",
+            Self::CourierBoldOblique => b"Courier-BoldOblique",
+            Self::Symbol => b"Symbol",
+            Self::ZapfDingbats => b"ZapfDingbats",
         }
     }
 
     pub fn resource_name(self) -> &'static [u8] {
+        const NAMES: [&[u8]; 14] = [
+            b"F1", b"F2", b"F3", b"F4", b"F5", b"F6", b"F7", b"F8", b"F9", b"F10", b"F11", b"F12",
+            b"F13", b"F14",
+        ];
+        NAMES[self.index()]
+    }
+
+    fn afm(self) -> &'static str {
         match self {
-            Self::Regular => b"F1",
-            Self::Bold => b"F2",
-            Self::Oblique => b"F3",
-            Self::BoldOblique => b"F4",
+            Self::HelveticaRegular => AFM_HELVETICA_REGULAR,
+            Self::HelveticaBold => AFM_HELVETICA_BOLD,
+            Self::HelveticaOblique => AFM_HELVETICA_OBLIQUE,
+            Self::HelveticaBoldOblique => AFM_HELVETICA_BOLD_OBLIQUE,
+            Self::TimesRegular => AFM_TIMES_REGULAR,
+            Self::TimesBold => AFM_TIMES_BOLD,
+            Self::TimesOblique => AFM_TIMES_OBLIQUE,
+            Self::TimesBoldOblique => AFM_TIMES_BOLD_OBLIQUE,
+            Self::CourierRegular => AFM_COURIER_REGULAR,
+            Self::CourierBold => AFM_COURIER_BOLD,
+            Self::CourierOblique => AFM_COURIER_OBLIQUE,
+            Self::CourierBoldOblique => AFM_COURIER_BOLD_OBLIQUE,
+            Self::Symbol => AFM_SYMBOL,
+            Self::ZapfDingbats => AFM_ZAPF_DINGBATS,
         }
     }
+
+    fn widths(self) -> &'static [u16; 256] {
+        static WIDTHS: OnceLock<Vec<[u16; 256]>> = OnceLock::new();
+        let widths = WIDTHS.get_or_init(|| {
+            Self::all()
+                .iter()
+                .map(|kind| parse_afm_widths(kind.afm()))
+                .collect()
+        });
+        &widths[self.index()]
+    }
+
+    pub fn encode(self, text: &str) -> Vec<u8> {
+        text.chars()
+            .map(|ch| self.encode_char(ch).unwrap_or(b'?'))
+            .collect()
+    }
+
+    fn encode_char(self, ch: char) -> Option<u8> {
+        match self.family() {
+            BuiltinFamily::Symbol => symbol_code(ch).or_else(|| win_ansi_code(ch)),
+            BuiltinFamily::ZapfDingbats => dingbat_code(ch).or_else(|| win_ansi_code(ch)),
+            _ => win_ansi_code(ch),
+        }
+    }
+
+    fn char_width_units(self, ch: char) -> u32 {
+        self.encode_char(ch)
+            .map(|code| self.widths()[code as usize] as u32)
+            .unwrap_or(556)
+    }
+}
+
+fn parse_afm_widths(afm: &str) -> [u16; 256] {
+    let mut widths = [0u16; 256];
+    for line in afm.lines() {
+        let Some(rest) = line.strip_prefix("C ") else {
+            continue;
+        };
+        let mut parts = rest.split(';');
+        let Some(code) = parts
+            .next()
+            .and_then(|part| part.trim().parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(width) = parts
+            .filter_map(|part| part.trim().strip_prefix("WX "))
+            .next()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+        else {
+            continue;
+        };
+        if code < widths.len() {
+            widths[code] = width;
+        }
+    }
+    widths
+}
+
+pub(crate) fn win_ansi_code(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if (32..=126).contains(&code) || (160..=255).contains(&code) {
+        return Some(code as u8);
+    }
+    crate::CP1252_HIGH
+        .iter()
+        .position(|&mapped| mapped == ch)
+        .map(|index| 0x80 + index as u8)
+}
+
+fn symbol_code(ch: char) -> Option<u8> {
+    let code = match ch {
+        'α'..='ω' => 0x61 + (ch as u32 - 'α' as u32) as u8,
+        'Α'..='Ω' => 0x41 + (ch as u32 - 'Α' as u32) as u8,
+        '∀' => 0x22,
+        '∃' => 0x24,
+        '∈' => 0xCE,
+        '∉' => 0xCF,
+        '∅' => 0xC6,
+        '∇' => 0x6E,
+        '∏' => 0xD5,
+        '∑' => 0xE5,
+        '−' => 0x2D,
+        '√' => 0xD6,
+        '∝' => 0xD1,
+        '∞' => 0xA5,
+        '∠' => 0xD0,
+        '∧' => 0xD9,
+        '∨' => 0xDA,
+        '∩' => 0xC7,
+        '∪' => 0xC8,
+        '⊂' => 0xCC,
+        '⊃' => 0xC9,
+        '⊇' => 0xCA,
+        '⊕' => 0xC5,
+        '⊥' => 0x5E,
+        '≈' => 0x40,
+        '≅' => 0xE1,
+        '≡' => 0xBA,
+        '≤' => 0xA3,
+        '≥' => 0xB3,
+        '≠' => 0xB9,
+        '⇔' => 0xDB,
+        '⇐' => 0xDC,
+        '⇒' => 0xDD,
+        '°' => 0xB0,
+        'µ' => 0xB5,
+        '¥' => 0xA4,
+        '¢' => 0xA2,
+        '£' => 0xA3,
+        '§' => 0xA7,
+        _ => return None,
+    };
+    Some(code)
+}
+
+fn dingbat_code(ch: char) -> Option<u8> {
+    let code = match ch {
+        '✓' | '✔' => 0x34,
+        '✗' | '✘' => 0x35,
+        '★' => 0x56,
+        '☆' => 0x57,
+        '●' => 0x6C,
+        '○' => 0x6D,
+        '■' => 0x6E,
+        '□' => 0x6F,
+        '◆' => 0x6A,
+        '◇' => 0x6B,
+        '→' => 0x2B,
+        '←' => 0x2C,
+        '↑' => 0x2D,
+        '↓' => 0x2E,
+        '©' => 0x62,
+        _ => return None,
+    };
+    Some(code)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,6 +705,26 @@ pub struct ImageAsset {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub alpha: Option<Vec<u8>>,
+}
+
+impl ImageAsset {
+    pub fn flattened_pixels(&self) -> Vec<u8> {
+        let Some(alpha) = &self.alpha else {
+            return self.pixels.clone();
+        };
+        self.pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(alpha)
+            .flat_map(|(rgb, &alpha)| {
+                let alpha = alpha as u16;
+                rgb.iter()
+                    .map(move |&value| ((value as u16 * alpha + 255 * (255 - alpha)) / 255) as u8)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1416,8 +1733,8 @@ impl Collector {
             .to_ascii_lowercase();
 
         let kind = FontKind::from_style(style);
-        let bold = matches!(kind, FontKind::Bold | FontKind::BoldOblique);
-        let italic = matches!(kind, FontKind::Oblique | FontKind::BoldOblique);
+        let bold = style.bold;
+        let italic = style.italic;
 
         self.fonts
             .iter()
@@ -1753,13 +2070,24 @@ impl Collector {
 }
 
 fn load_image_bytes(bytes: &[u8]) -> Option<ImageAsset> {
-    let image = image::load_from_memory(bytes).ok()?.to_rgb8();
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+    let mut alpha = Vec::with_capacity(width as usize * height as usize);
+    let mut has_alpha = false;
+
+    for channel in rgba.as_chunks::<4>().0 {
+        pixels.extend_from_slice(&channel[..3]);
+        alpha.push(channel[3]);
+        has_alpha |= channel[3] != 255;
+    }
 
     Some(ImageAsset {
         width,
         height,
-        pixels: image.into_raw(),
+        pixels,
+        alpha: has_alpha.then_some(alpha),
     })
 }
 
@@ -2512,20 +2840,34 @@ fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<Emb
     let units_per_em = face.units_per_em();
     let mut advance = HashMap::new();
     let mut glyphs = HashMap::new();
-
-    for code in (0x20u32..=0x2ff).chain([0x25cf, 0x2713]) {
-        let Some(ch) = char::from_u32(code) else {
-            continue;
-        };
+    let mut add_glyph = |ch: char| {
         let Some(glyph) = face.glyph_index(ch) else {
-            continue;
+            return;
         };
         if glyph.0 == 0 {
-            continue;
+            return;
         }
         let width = face.glyph_hor_advance(glyph).unwrap_or(0) as f32 / units_per_em as f32;
         advance.insert(ch, width);
         glyphs.insert(ch, glyph.0);
+    };
+
+    for code in (0x20u32..=0x7e).chain(0xa0u32..=0xff) {
+        if let Some(ch) = char::from_u32(code) {
+            add_glyph(ch);
+        }
+    }
+    if let Some(cmap) = face.tables().cmap {
+        for subtable in cmap.subtables {
+            if !subtable.is_unicode() {
+                continue;
+            }
+            subtable.codepoints(|code| {
+                if let Some(ch) = char::from_u32(code) {
+                    add_glyph(ch);
+                }
+            });
+        }
     }
 
     let is_cff = face.tables().cff.is_some() || face.tables().cff2.is_some();
@@ -3120,12 +3462,25 @@ fn walk(
             .lists
             .last_mut()
             .and_then(|state| {
-                let value = state.counter;
-                state.counter += state.step;
+                let value = element
+                    .attr("value")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(state.counter);
+                state.counter = value + state.step;
                 list_marker(&state.style, value, &collector.counter_styles)
             })
             .unwrap_or_else(|| "• ".to_string());
-        collector.push_text(&prefix, &style);
+        if let Some(index) = style
+            .list_style_image
+            .as_deref()
+            .and_then(|url| collector.load_image_index(url))
+        {
+            let size = style.font_size * 0.75;
+            collector.push_image_item(index, Some(size), Some(size), &style);
+            collector.push_text(" ", &style);
+        } else {
+            collector.push_text(&prefix, &style);
+        }
     }
 
     let before_style = pseudo_style_for(&element, &style, rules, PseudoElement::Before);
@@ -3213,18 +3568,28 @@ fn prepare_cell_style(
     cell: &TableCell<'_>,
     style: &Style,
     rules: &[Rule],
-    padding: Option<Length>,
+    background: Option<[f32; 3]>,
+    border: Option<BorderSpec>,
+    padding: [Length; 4],
 ) -> Style {
     let mut cell_style = style_for(&cell.element, style, rules);
-    let owns_padding = cell
-        .element
-        .attr("style")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("padding"));
-    if !owns_padding && let Some(padding) = padding {
-        cell_style.padding_top = padding;
-        cell_style.padding_right = padding;
-        cell_style.padding_bottom = padding;
-        cell_style.padding_left = padding;
+    if cell_style.background.is_none() {
+        cell_style.background = background;
+    }
+    if cell_style.border.is_none() {
+        cell_style.border = border;
+    }
+    let cell_padding = [
+        cell_style.padding_top,
+        cell_style.padding_right,
+        cell_style.padding_bottom,
+        cell_style.padding_left,
+    ];
+    if cell_padding.iter().all(|length| length.value == 0.0) {
+        cell_style.padding_top = padding[0];
+        cell_style.padding_right = padding[1];
+        cell_style.padding_bottom = padding[2];
+        cell_style.padding_left = padding[3];
     }
     cell_style
 }
@@ -3345,8 +3710,15 @@ fn layout_table<'a>(
         .break_stack
         .push(BlockBreakState::from_style(style, break_before));
 
-    let table_background = table.attr("bgcolor").and_then(parse_color);
-    let cell_padding = table.attr("cellpadding").and_then(parse_length);
+    let table_background = style.background;
+    let table_border = style.border;
+    let table_padding = [
+        style.padding_top,
+        style.padding_right,
+        style.padding_bottom,
+        style.padding_left,
+    ];
+    let table_width = style.width_pt().unwrap_or(collector.max_width);
     let spacing = if style.border_collapse == BorderCollapse::Collapse {
         0.0
     } else {
@@ -3417,13 +3789,25 @@ fn layout_table<'a>(
             if !measured.insert((row_index, column_index)) {
                 continue;
             }
-            let cell_style = prepare_cell_style(cell, style, rules, cell_padding);
+            let cell_style = prepare_cell_style(
+                cell,
+                style,
+                rules,
+                table_background,
+                table_border,
+                table_padding,
+            );
             let text = cell.element.text().collect::<String>();
-            let natural = cell
-                .element
-                .attr("width")
-                .and_then(parse_length)
-                .map(|length| length.resolve_with(cell_style.font_size, cell_style.px_scale))
+            let natural = cell_style
+                .width_pt()
+                .or_else(|| {
+                    cell.element
+                        .attr("width")
+                        .and_then(parse_length)
+                        .map(|length| {
+                            length.resolve_with(cell_style.font_size, cell_style.px_scale)
+                        })
+                })
                 .unwrap_or_else(|| collector.text_width(text.trim(), &cell_style));
             let padding = cell_style.padding_left_pt() + cell_style.padding_right_pt();
             let needed = (natural + padding) / cell.colspan as f32;
@@ -3437,8 +3821,7 @@ fn layout_table<'a>(
         }
     }
 
-    let available =
-        (collector.max_width - spacing * column_count.saturating_sub(1) as f32).max(1.0);
+    let available = (table_width - spacing * column_count.saturating_sub(1) as f32).max(1.0);
     let desired_total: f32 = desired.iter().sum();
     let column_widths = if desired_total <= 0.0 {
         vec![available / column_count as f32; column_count]
@@ -3490,10 +3873,14 @@ fn layout_table<'a>(
                 }
             }
 
-            let mut cell_style = prepare_cell_style(&cell, style, rules, cell_padding);
-            if cell_style.background.is_none() {
-                cell_style.background = table_background;
-            }
+            let cell_style = prepare_cell_style(
+                &cell,
+                style,
+                rules,
+                table_background,
+                table_border,
+                table_padding,
+            );
             let padding_left = cell_style.padding_left_pt();
             let padding_right = cell_style.padding_right_pt();
             let padding_top = cell_style.padding_top_pt();
@@ -3883,10 +4270,7 @@ pub fn measure(text: &str, size: f32, font: FontId, fonts: &[EmbeddedFont]) -> f
     let units = text
         .chars()
         .map(|ch| match font {
-            FontId::Builtin(_) => match ch as u32 {
-                32..=126 => HELVETICA_WIDTHS[ch as usize - 32] as u32,
-                _ => 556,
-            },
+            FontId::Builtin(kind) => kind.char_width_units(ch),
             FontId::Embedded(index) => fonts
                 .get(index)
                 .and_then(|embedded| embedded.advance.get(&ch))
@@ -3948,5 +4332,20 @@ mod woff2_tests {
         push_i16(&mut expected, 20);
         push_i16(&mut expected, 30);
         assert_eq!(output, expected);
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn loads_unicode_cmap_glyphs() {
+        let font = load_font("DejaVuSans", PDFA_FONT_BYTES, false, false).unwrap();
+
+        assert!(font.glyphs.len() > 1000);
+        assert!(font.glyphs.contains_key(&'α'));
+        assert!(font.glyphs.contains_key(&'Ж'));
+        assert!(font.glyphs.contains_key(&'✓'));
     }
 }

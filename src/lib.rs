@@ -329,7 +329,7 @@ pub fn render_html_with_options(html: &str, base: &Path, options: &Options) -> V
     pdf::write_pdf(&document)
 }
 
-const CP1252_HIGH: [char; 32] = [
+pub(crate) const CP1252_HIGH: [char; 32] = [
     '\u{20ac}', '\u{fffd}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
     '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffd}', '\u{017d}', '\u{fffd}',
     '\u{fffd}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',

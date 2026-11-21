@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use aes::Aes128;
 use cbc::Encryptor;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit, generic_array::GenericArray};
@@ -29,6 +31,7 @@ struct FontRefs {
 #[derive(Clone, Copy)]
 struct FormFont<'a> {
     id: Ref,
+    font: FontId,
     embedded: Option<&'a crate::layout::EmbeddedFont>,
 }
 
@@ -114,13 +117,27 @@ fn outline_descendant_count(nodes: &[OutlineNode], index: usize) -> usize {
 
 pub fn write_pdf(document: &Document) -> Vec<u8> {
     let mut pdf = Pdf::new();
+    let used_chars = collect_used_chars(document);
     let catalog_id = Ref::new(1);
     let pages_id = Ref::new(2);
-    let mut font_ids = [Ref::new(3), Ref::new(4), Ref::new(5), Ref::new(6)];
-    let image_refs = (0..document.images.len())
-        .map(|index| Ref::new(7 + index as i32))
+    let mut font_ids = (0..FontKind::all().len())
+        .map(|index| Ref::new(3 + index as i32))
         .collect::<Vec<_>>();
-    let mut font_base_id = 7 + image_refs.len() as i32;
+    let image_refs = (0..document.images.len())
+        .map(|index| Ref::new(17 + index as i32))
+        .collect::<Vec<_>>();
+    let image_alpha_refs = document
+        .images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            image
+                .alpha
+                .as_ref()
+                .map(|_| Ref::new(17 + document.images.len() as i32 + index as i32))
+        })
+        .collect::<Vec<_>>();
+    let mut font_base_id = 17 + document.images.len() as i32 * 2;
     let pdf_a_font_refs = if document.pdf_a || document.pdf_ua {
         let refs = (0..4)
             .map(|index| {
@@ -136,10 +153,10 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             .collect::<Vec<_>>();
         font_ids = refs
             .iter()
+            .cycle()
+            .take(FontKind::all().len())
             .map(|refs| refs.type0)
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("four PDF/A fonts");
+            .collect();
         font_base_id += 20;
         refs
     } else {
@@ -507,19 +524,19 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             let bold = index == 1 || index == 3;
             let italic = index >= 2;
             if let Some(font) = load_pdf_a_font(bold, italic) {
-                write_embedded_font(&mut pdf, &font, refs);
+                write_embedded_font(&mut pdf, &font, refs, &used_chars);
             }
         }
     } else {
-        for (&id, base) in font_ids.iter().zip([
-            b"Helvetica".as_slice(),
-            b"Helvetica-Bold".as_slice(),
-            b"Helvetica-Oblique".as_slice(),
-            b"Helvetica-BoldOblique".as_slice(),
-        ]) {
+        for (&id, kind) in font_ids.iter().zip(FontKind::all()) {
+            let encoding = if kind.is_font_specific() {
+                b"FontSpecific".as_slice()
+            } else {
+                b"WinAnsiEncoding".as_slice()
+            };
             pdf.type1_font(id)
-                .base_font(Name(base))
-                .encoding_predefined(Name(b"WinAnsiEncoding"));
+                .base_font(Name(kind.base_font_name()))
+                .encoding_predefined(Name(encoding));
         }
     }
 
@@ -529,17 +546,44 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
             .stroking_alpha(alpha);
     }
 
-    for (asset, &id) in document.images.iter().zip(image_refs.iter()) {
-        pdf.image_xobject(id, asset.pixels.as_slice())
+    for ((asset, &id), alpha_id) in document
+        .images
+        .iter()
+        .zip(image_refs.iter())
+        .zip(image_alpha_refs.iter())
+    {
+        let pixels = if document.pdf_a {
+            asset.flattened_pixels()
+        } else {
+            asset.pixels.clone()
+        };
+        let mut image = pdf.image_xobject(id, pixels.as_slice());
+        image
             .width(asset.width as i32)
             .height(asset.height as i32)
             .color_space_name(Name(b"DeviceRGB"))
-            .bits_per_component(8)
-            .finish();
+            .bits_per_component(8);
+        if !document.pdf_a
+            && let Some(id) = alpha_id
+        {
+            image.s_mask(*id);
+        }
+        image.finish();
+
+        if !document.pdf_a
+            && let (Some(id), Some(alpha)) = (alpha_id, asset.alpha.as_ref())
+        {
+            pdf.image_xobject(*id, alpha.as_slice())
+                .width(asset.width as i32)
+                .height(asset.height as i32)
+                .color_space_name(Name(b"DeviceGray"))
+                .bits_per_component(8)
+                .finish();
+        }
     }
 
     for (font, refs) in document.fonts.iter().zip(font_refs.iter()) {
-        write_embedded_font(&mut pdf, font, refs);
+        write_embedded_font(&mut pdf, font, refs, &used_chars);
     }
 
     for (page_index, page) in document.pages.iter().enumerate() {
@@ -604,6 +648,11 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
                                 struct_parent: (document.pages.len() + form_index) as i32,
                                 font: FormFont {
                                     id: font_ids[0],
+                                    font: if document.pdf_a || document.pdf_ua {
+                                        FontId::Embedded(0)
+                                    } else {
+                                        FontId::Builtin(FontKind::HelveticaRegular)
+                                    },
                                     embedded: if document.pdf_a || document.pdf_ua {
                                         document.fonts.first()
                                     } else {
@@ -637,10 +686,10 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         {
             let mut resources = page_writer.resources();
             let mut fonts = resources.fonts();
-            fonts.pair(Name(b"F1"), font_ids[0]);
-            fonts.pair(Name(b"F2"), font_ids[1]);
-            fonts.pair(Name(b"F3"), font_ids[2]);
-            fonts.pair(Name(b"F4"), font_ids[3]);
+            for (index, &id) in font_ids.iter().enumerate() {
+                let name = format!("F{}", index + 1);
+                fonts.pair(Name(name.as_bytes()), id);
+            }
             for (index, _) in document.fonts.iter().enumerate() {
                 let name = format!("E{}", index + 1);
                 fonts.pair(Name(name.as_bytes()), font_refs[index].type0);
@@ -681,7 +730,12 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
     }
 }
 
-fn write_embedded_font(pdf: &mut Pdf, font: &crate::layout::EmbeddedFont, refs: &FontRefs) {
+fn write_embedded_font(
+    pdf: &mut Pdf,
+    font: &crate::layout::EmbeddedFont,
+    refs: &FontRefs,
+    used_chars: &HashSet<char>,
+) {
     let info = SystemInfo {
         registry: Str(b"Adobe"),
         ordering: Str(b"Identity"),
@@ -700,7 +754,9 @@ fn write_embedded_font(pdf: &mut Pdf, font: &crate::layout::EmbeddedFont, refs: 
 
     let mut cmap = UnicodeCmap::<u16>::new(Name(b"Custom"), info);
     for (&ch, &glyph) in &font.glyphs {
-        cmap.pair(glyph, ch);
+        if used_chars.contains(&ch) {
+            cmap.pair(glyph, ch);
+        }
     }
     pdf.stream(refs.to_unicode, cmap.finish().as_slice())
         .finish();
@@ -740,8 +796,10 @@ fn write_embedded_font(pdf: &mut Pdf, font: &crate::layout::EmbeddedFont, refs: 
     {
         let mut widths = cid.widths();
         for (&ch, &glyph) in &font.glyphs {
-            let width = font.advance.get(&ch).copied().unwrap_or(0.5) * 1000.0;
-            widths.consecutive(glyph, [width]);
+            if used_chars.contains(&ch) {
+                let width = font.advance.get(&ch).copied().unwrap_or(0.5) * 1000.0;
+                widths.consecutive(glyph, [width]);
+            }
         }
         widths.finish();
     }
@@ -753,6 +811,32 @@ fn write_embedded_font(pdf: &mut Pdf, font: &crate::layout::EmbeddedFont, refs: 
         .descendant_font(refs.cid)
         .to_unicode(refs.to_unicode)
         .finish();
+}
+
+fn collect_used_chars(document: &Document) -> HashSet<char> {
+    let mut chars = HashSet::from(['?']);
+    for page in &document.pages {
+        for line in page
+            .lines
+            .iter()
+            .chain(page.overlays.iter().map(|o| &o.line))
+        {
+            for item in &line.items {
+                match item {
+                    InlineItem::Text(run) => chars.extend(run.text.chars()),
+                    InlineItem::Form(form) => {
+                        chars.extend(form.control.display_text().chars());
+                        chars.extend(form.control.field_name().chars());
+                    }
+                    InlineItem::Image(_) => {}
+                }
+            }
+        }
+    }
+    if let Some(page_text) = &document.page_text {
+        chars.extend(page_text.chars());
+    }
+    chars
 }
 
 fn struct_role_kind(role: StructureRole) -> StructRole {
@@ -967,7 +1051,7 @@ fn write_form_appearance(
     checked: bool,
     font: FormFont<'_>,
 ) {
-    let content = build_form_appearance(width, height, control, checked, font.embedded);
+    let content = build_form_appearance(width, height, control, checked, font);
     let mut xobject = pdf.form_xobject(id, &content);
     xobject.bbox(Rect::new(0.0, 0.0, width, height));
     xobject.resources().fonts().pair(Name(b"F1"), font.id);
@@ -979,7 +1063,7 @@ fn build_form_appearance(
     height: f32,
     control: &FormControl,
     checked: bool,
-    font: Option<&crate::layout::EmbeddedFont>,
+    font: FormFont<'_>,
 ) -> Vec<u8> {
     let mut content = Content::new();
     content.begin_marked_content(Name(b"Artifact"));
@@ -1016,7 +1100,7 @@ fn build_form_appearance(
                     .begin_text()
                     .set_text_matrix([1.0, 0.0, 0.0, 1.0, 3.0, height * 0.28])
                     .set_font(Name(b"F1"), size)
-                    .show(Str(&encode_font_text(text, font)))
+                    .show(Str(&encode_font_text(text, font.font, font.embedded)))
                     .end_text();
             }
         }
@@ -1081,10 +1165,14 @@ fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
     bytes
 }
 
-fn encode_font_text(text: &str, font: Option<&crate::layout::EmbeddedFont>) -> Vec<u8> {
+fn encode_font_text(
+    text: &str,
+    font: FontId,
+    embedded: Option<&crate::layout::EmbeddedFont>,
+) -> Vec<u8> {
     match font {
-        Some(font) => to_cids(text, font),
-        None => to_win_ansi(text),
+        FontId::Builtin(kind) => kind.encode(text),
+        FontId::Embedded(_) => embedded.map(|font| to_cids(text, font)).unwrap_or_default(),
     }
 }
 
@@ -1321,7 +1409,7 @@ fn build_content(
     let base_font_id = if document.pdf_a || document.pdf_ua {
         FontId::Embedded(0)
     } else {
-        FontId::Builtin(FontKind::Regular)
+        FontId::Builtin(FontKind::HelveticaRegular)
     };
 
     let mut drawable = page
@@ -1707,7 +1795,7 @@ fn build_content(
                 InlineItem::Text(run) => {
                     let name = font_resource(run.font);
                     let bytes = match run.font {
-                        FontId::Builtin(_) => to_win_ansi(&run.text),
+                        FontId::Builtin(kind) => kind.encode(&run.text),
                         FontId::Embedded(index) => to_cids(&run.text, &document.fonts[index]),
                     };
 
@@ -1801,7 +1889,7 @@ fn build_content(
                 let top = line.top + (line.height - form.height) / 2.0;
                 let y = height - margin_top - top - form.height;
                 let text = form.control.display_text();
-                let bytes = encode_font_text(&text, base_font);
+                let bytes = encode_font_text(&text, base_font_id, base_font);
                 content
                     .save_state()
                     .set_stroke_rgb(0.35, 0.35, 0.35)
@@ -1828,7 +1916,7 @@ fn build_content(
         let text = template
             .replace("{PAGE_NUM}", &(page_index + 1).to_string())
             .replace("{PAGE_COUNT}", &page_count.to_string());
-        let bytes = encode_font_text(&text, base_font);
+        let bytes = encode_font_text(&text, base_font_id, base_font);
         if !bytes.is_empty() {
             let text_width = measure(&text, 9.0, base_font_id, &document.fonts);
             let (x, y) = match document.page_text_location {
@@ -1862,16 +1950,6 @@ fn build_content(
     }
 
     content.finish().into_vec()
-}
-
-fn to_win_ansi(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|ch| match ch as u32 {
-            32..=126 => ch as u8,
-            160..=255 => ch as u8,
-            _ => b'?',
-        })
-        .collect()
 }
 
 #[derive(Clone)]

@@ -36,6 +36,22 @@ fn options_override_pdf_metadata() {
 }
 
 #[test]
+fn renders_additional_builtin_font_families() {
+    let pdf = html2pdf_rs::render_html(
+        "<p style=\"font-family:Times,serif\">Satu</p>\
+         <p style=\"font-family:Courier,monospace\">Dua</p>\
+         <p style=\"font-family:Symbol\">&#x221E;</p>\
+         <p style=\"font-family:ZapfDingbats\">&#x2714;</p>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/BaseFont /Times-Roman"));
+    assert!(raw.contains("/BaseFont /Courier"));
+    assert!(raw.contains("/BaseFont /Symbol"));
+    assert!(raw.contains("/BaseFont /ZapfDingbats"));
+}
+
+#[test]
 fn decodes_windows_1252_html_bytes() {
     let decoded =
         html2pdf_rs::decode_html_bytes(b"<title>Caf\xe9 \x93Tes\x94</title>", "windows-1252");
@@ -435,6 +451,32 @@ fn embeds_data_uri_image() {
 }
 
 #[test]
+fn preserves_image_alpha_with_smask() {
+    use base64::Engine;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+    use std::path::Path;
+
+    let mut png = Vec::new();
+    let pixels = [
+        255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 64, 255, 255, 255, 0,
+    ];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, 2, 2, ExtendedColorType::Rgba8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let html = format!("<img src=\"data:image/png;base64,{encoded}\" width=\"40\" height=\"20\">");
+
+    let pdf = html2pdf_rs::render_html(&html);
+    let raw = String::from_utf8_lossy(&pdf);
+    assert!(raw.contains("/SMask"));
+    assert!(raw.contains("/DeviceGray"));
+
+    let options = html2pdf_rs::Options::default().pdf_a();
+    let pdf_a = html2pdf_rs::render_html_with_options(&html, Path::new("."), &options);
+    assert!(!String::from_utf8_lossy(&pdf_a).contains("/SMask"));
+}
+
+#[test]
 fn embeds_local_image() {
     use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 
@@ -684,16 +726,103 @@ fn applies_presentational_attributes_with_css_precedence() {
 }
 
 #[test]
+fn applies_html4_presentational_attributes() {
+    use html2pdf_rs::css::{Style, TextAlign, VerticalAlign, WhiteSpace, style_for};
+    use scraper::{Element, ElementRef, Html};
+
+    let document = Html::parse_fragment(
+        "<table width=\"200\" border=\"1\" cellpadding=\"4\" cellspacing=\"6\" bgcolor=\"#ff0000\">\
+         <tr><td align=\"right\" valign=\"bottom\" nowrap>X</td></tr></table>",
+    );
+    let table = document.root_element().first_element_child().unwrap();
+    let table_style = style_for(&table, &Style::default(), &[]);
+    assert_eq!(table_style.background, Some([1.0, 0.0, 0.0]));
+    assert!(table_style.border.is_some_and(|border| border.width == 1.0));
+    assert!((table_style.border_spacing - 6.0).abs() < 0.001);
+    assert!((table_style.padding_top_pt() - 4.0).abs() < 0.001);
+    assert!((table_style.width_pt().unwrap() - 200.0).abs() < 0.001);
+
+    let cell = table
+        .descendants()
+        .filter_map(ElementRef::wrap)
+        .find(|element| element.value().name() == "td")
+        .unwrap();
+    let cell_style = style_for(&cell, &table_style, &[]);
+    assert_eq!(cell_style.text_align, TextAlign::Right);
+    assert_eq!(cell_style.vertical_align, VerticalAlign::Bottom);
+    assert_eq!(cell_style.white_space, WhiteSpace::Nowrap);
+
+    let font_document =
+        Html::parse_fragment("<font face=\"Courier\" size=\"5\" color=\"blue\">X</font>");
+    let font = font_document.root_element().first_element_child().unwrap();
+    let font_style = style_for(&font, &Style::default(), &[]);
+    assert_eq!(font_style.font_family, "Courier");
+    assert!((font_style.font_size - 18.0).abs() < 0.001);
+    assert_eq!(font_style.color, [0.0, 0.0, 1.0]);
+
+    let image_document = Html::parse_fragment("<img align=\"top\" hspace=\"3\" vspace=\"5\">");
+    let image = image_document.root_element().first_element_child().unwrap();
+    let image_style = style_for(&image, &Style::default(), &[]);
+    assert_eq!(image_style.vertical_align, VerticalAlign::Top);
+    assert!((image_style.margin_left_pt() - 3.0).abs() < 0.001);
+    assert!((image_style.margin_top_pt() - 5.0).abs() < 0.001);
+}
+
+#[test]
+fn applies_box_sizing_and_list_style_shorthand() {
+    use base64::Engine;
+    use html2pdf_rs::css::{
+        BoxSizing, ListStyle, ListStylePosition, Style, apply_declarations, parse_declarations,
+    };
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "box-sizing:border-box;width:100px;padding:10px;border:2px solid black",
+        ),
+        12.0,
+    );
+    assert_eq!(style.box_sizing, BoxSizing::BorderBox);
+    assert!((style.width_pt().unwrap() - 57.0).abs() < 0.01);
+
+    let mut style = Style::default();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("list-style:square inside url(marker.png)"),
+        12.0,
+    );
+    assert_eq!(style.list_style, ListStyle::Square);
+    assert_eq!(style.list_style_position, ListStylePosition::Inside);
+    assert_eq!(style.list_style_image.as_deref(), Some("marker.png"));
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(&[255, 0, 0, 255], 1, 1, ExtendedColorType::Rgba8)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let pdf = html2pdf_rs::render_html(&format!(
+        "<style>li{{list-style-image:url(data:image/png;base64,{encoded})}}</style>\
+         <ol><li>X</li></ol>"
+    ));
+    assert!(String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
+}
+
+#[test]
 fn renders_ordered_list_markers() {
     let pdf = html2pdf_rs::render_html(
         "<ol start=\"3\" type=\"A\"><li>Satu</li><li>Dua</li></ol>\
-         <ol reversed start=\"2\"><li>Tiga</li></ol>",
+         <ol reversed start=\"2\"><li>Tiga</li></ol>\
+         <ol type=\"A\"><li value=\"5\">Lima</li><li>Enam</li></ol>",
     );
     let raw = String::from_utf8_lossy(&pdf);
 
     assert!(raw.contains("(C.)"));
     assert!(raw.contains("(D.)"));
     assert!(raw.contains("(2.)"));
+    assert!(raw.contains("(E.)"));
+    assert!(raw.contains("(F.)"));
 }
 
 #[test]

@@ -68,6 +68,20 @@ pub enum TextAlign {
     Justify,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListStylePosition {
+    #[default]
+    Outside,
+    Inside,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ListStyle {
     #[default]
@@ -359,6 +373,7 @@ pub struct Style {
     pub padding_left: Length,
     pub width: Option<Length>,
     pub height: Option<Length>,
+    pub box_sizing: BoxSizing,
     pub min_width: Option<Length>,
     pub max_width: Option<Length>,
     pub min_height: Option<Length>,
@@ -387,6 +402,8 @@ pub struct Style {
     pub containing_width: f32,
     pub containing_height: f32,
     pub list_style: ListStyle,
+    pub list_style_position: ListStylePosition,
+    pub list_style_image: Option<String>,
     pub text_indent: Length,
     pub letter_spacing: Length,
     pub word_spacing: Length,
@@ -438,6 +455,7 @@ impl Default for Style {
             padding_left: Length::default(),
             width: None,
             height: None,
+            box_sizing: BoxSizing::ContentBox,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -466,6 +484,8 @@ impl Default for Style {
             containing_width: 0.0,
             containing_height: 0.0,
             list_style: ListStyle::Disc,
+            list_style_position: ListStylePosition::Outside,
+            list_style_image: None,
             text_indent: Length::default(),
             letter_spacing: Length::default(),
             word_spacing: Length::default(),
@@ -512,6 +532,8 @@ impl Style {
             containing_width: parent.containing_width,
             containing_height: parent.containing_height,
             list_style: parent.list_style.clone(),
+            list_style_position: parent.list_style_position,
+            list_style_image: parent.list_style_image.clone(),
             text_indent: parent.text_indent,
             letter_spacing: parent.letter_spacing,
             word_spacing: parent.word_spacing,
@@ -582,20 +604,32 @@ impl Style {
     }
 
     pub fn width_pt(&self) -> Option<f32> {
+        let extra = if self.box_sizing == BoxSizing::BorderBox {
+            self.horizontal_box_extra()
+        } else {
+            0.0
+        };
         self.resolve_dimension(
             self.width,
             self.min_width,
             self.max_width,
             self.containing_width,
+            extra,
         )
     }
 
     pub fn height_pt(&self) -> Option<f32> {
+        let extra = if self.box_sizing == BoxSizing::BorderBox {
+            self.vertical_box_extra()
+        } else {
+            0.0
+        };
         self.resolve_dimension(
             self.height,
             self.min_height,
             self.max_height,
             self.containing_height,
+            extra,
         )
     }
 
@@ -605,6 +639,7 @@ impl Style {
         min: Option<Length>,
         max: Option<Length>,
         basis: f32,
+        extra: f32,
     ) -> Option<f32> {
         let resolve =
             |length: Length| length.resolve_with_size(self.font_size, basis, self.px_scale);
@@ -617,7 +652,29 @@ impl Style {
             let max = resolve(max);
             value = Some(value.unwrap_or(max).min(max));
         }
-        value
+        value.map(|value| (value - extra).max(0.0))
+    }
+
+    fn horizontal_box_extra(&self) -> f32 {
+        let border = self
+            .border
+            .map(|border| {
+                (if border.left { border.width } else { 0.0 })
+                    + (if border.right { border.width } else { 0.0 })
+            })
+            .unwrap_or(0.0);
+        self.padding_left_pt() + self.padding_right_pt() + border
+    }
+
+    fn vertical_box_extra(&self) -> f32 {
+        let border = self
+            .border
+            .map(|border| {
+                (if border.top { border.width } else { 0.0 })
+                    + (if border.bottom { border.width } else { 0.0 })
+            })
+            .unwrap_or(0.0);
+        self.padding_top_pt() + self.padding_bottom_pt() + border
     }
 }
 
@@ -1783,35 +1840,122 @@ fn find_matching_paren(input: &str) -> Option<usize> {
 
 fn presentational_declarations(element: &ElementRef) -> Vec<Declaration> {
     let mut declarations = Vec::new();
+    let tag = element.value().name();
+
     for (attribute, property) in [("bgcolor", "background-color"), ("color", "color")] {
         if let Some(value) = element.attr(attribute) {
-            declarations.push(Declaration {
-                property: property.to_string(),
-                value: value.to_string(),
-                important: false,
-            });
+            push_declaration(&mut declarations, property, value);
         }
     }
-    if let Some(value) = element.attr("align")
-        && let Some(align) = parse_align(value)
-    {
-        declarations.push(Declaration {
-            property: "text-align".to_string(),
-            value: align_name(align).to_string(),
-            important: false,
-        });
+    if let Some(value) = element.attr("background") {
+        push_declaration(
+            &mut declarations,
+            "background-image",
+            format!("url(\"{}\")", value.replace('"', "%22")),
+        );
+    }
+    if let Some(value) = element.attr("align") {
+        let lower = value.trim().to_ascii_lowercase();
+        if matches!(lower.as_str(), "top" | "middle" | "bottom" | "baseline") {
+            push_declaration(&mut declarations, "vertical-align", lower);
+        } else if let Some(align) = parse_align(value) {
+            push_declaration(&mut declarations, "text-align", align_name(align));
+        }
+    }
+    if let Some(value) = element.attr("valign") {
+        push_declaration(&mut declarations, "vertical-align", value);
+    }
+    if element.attr("nowrap").is_some() {
+        push_declaration(&mut declarations, "white-space", "nowrap");
+    }
+    if let Some(value) = element.attr("clear") {
+        let value = if value.trim().eq_ignore_ascii_case("all") {
+            "both"
+        } else {
+            value
+        };
+        push_declaration(&mut declarations, "clear", value);
     }
     if let Some(value) = element.attr("type")
         && let Some(list) = list_style_from_html_type(value)
     {
-        declarations.push(Declaration {
-            property: "list-style-type".to_string(),
-            value: list_style_name(list).to_string(),
-            important: false,
-        });
+        push_declaration(&mut declarations, "list-style-type", list_style_name(list));
+    }
+    for (attribute, property) in [
+        ("width", "width"),
+        ("height", "height"),
+        ("cellpadding", "padding"),
+        ("cellspacing", "border-spacing"),
+        ("hspace", "margin-left"),
+        ("vspace", "margin-top"),
+    ] {
+        if let Some(value) = element.attr(attribute) {
+            push_declaration(&mut declarations, property, value);
+            if attribute == "hspace" {
+                push_declaration(&mut declarations, "margin-right", value);
+            } else if attribute == "vspace" {
+                push_declaration(&mut declarations, "margin-bottom", value);
+            }
+        }
+    }
+    if let Some(value) = element.attr("border") {
+        if value.trim() == "0" {
+            push_declaration(&mut declarations, "border", "none");
+        } else {
+            push_declaration(&mut declarations, "border", format!("{value} solid"));
+        }
+    }
+    if let Some(value) = element.attr("bordercolor") {
+        push_declaration(&mut declarations, "border-color", value);
+    }
+    if tag == "font" {
+        if let Some(value) = element.attr("face") {
+            push_declaration(&mut declarations, "font-family", value);
+        }
+        if let Some(value) = element.attr("size")
+            && let Some(size) = html_font_size(value)
+        {
+            push_declaration(&mut declarations, "font-size", size);
+        }
     }
 
     declarations
+}
+
+fn push_declaration(declarations: &mut Vec<Declaration>, property: &str, value: impl Into<String>) {
+    declarations.push(Declaration {
+        property: property.to_string(),
+        value: value.into(),
+        important: false,
+    });
+}
+
+fn html_font_size(value: &str) -> Option<&'static str> {
+    match value.trim().parse::<i32>().ok()? {
+        1 => Some("x-small"),
+        2 => Some("small"),
+        3 => Some("medium"),
+        4 => Some("large"),
+        5 => Some("x-large"),
+        6 => Some("xx-large"),
+        7 => Some("xxx-large"),
+        _ => None,
+    }
+}
+
+fn css_list_style_type(value: &str) -> Option<ListStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disc" => Some(ListStyle::Disc),
+        "circle" => Some(ListStyle::Circle),
+        "square" => Some(ListStyle::Square),
+        "decimal" => Some(ListStyle::Decimal),
+        "lower-alpha" | "lower-latin" => Some(ListStyle::LowerAlpha),
+        "upper-alpha" | "upper-latin" => Some(ListStyle::UpperAlpha),
+        "lower-roman" => Some(ListStyle::LowerRoman),
+        "upper-roman" => Some(ListStyle::UpperRoman),
+        "none" => Some(ListStyle::None),
+        _ => None,
+    }
 }
 
 pub fn list_style_from_html_type(value: &str) -> Option<ListStyle> {
@@ -2380,20 +2524,50 @@ fn apply_style_declarations(
                     style.text_align = align;
                 }
             }
+            "box-sizing" => {
+                style.box_sizing = if value.trim().eq_ignore_ascii_case("border-box") {
+                    BoxSizing::BorderBox
+                } else {
+                    BoxSizing::ContentBox
+                };
+            }
+            "list-style" => {
+                let lower = value.to_ascii_lowercase();
+                if lower.contains("inside") {
+                    style.list_style_position = ListStylePosition::Inside;
+                } else if lower.contains("outside") {
+                    style.list_style_position = ListStylePosition::Outside;
+                }
+                if let Some(url) = extract_url(value) {
+                    style.list_style_image = Some(url);
+                } else if lower.split_whitespace().any(|token| token == "none") {
+                    style.list_style_image = None;
+                }
+                for token in split_css_tokens(value) {
+                    if let Some(list_style) = css_list_style_type(&token) {
+                        style.list_style = list_style;
+                    }
+                }
+            }
+            "list-style-position" => {
+                style.list_style_position = if value.trim().eq_ignore_ascii_case("inside") {
+                    ListStylePosition::Inside
+                } else {
+                    ListStylePosition::Outside
+                };
+            }
+            "list-style-image" => {
+                style.list_style_image = if value.trim().eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    extract_url(value)
+                };
+            }
             "list-style-type" => {
                 let raw = value.trim();
-                style.list_style = match raw.to_ascii_lowercase().as_str() {
-                    "disc" => ListStyle::Disc,
-                    "circle" => ListStyle::Circle,
-                    "square" => ListStyle::Square,
-                    "decimal" => ListStyle::Decimal,
-                    "lower-alpha" | "lower-latin" => ListStyle::LowerAlpha,
-                    "upper-alpha" | "upper-latin" => ListStyle::UpperAlpha,
-                    "lower-roman" => ListStyle::LowerRoman,
-                    "upper-roman" => ListStyle::UpperRoman,
-                    "none" => ListStyle::None,
-                    _ => ListStyle::Custom(raw.trim_matches(['"', '\'']).to_string()),
-                };
+                style.list_style = css_list_style_type(raw).unwrap_or_else(|| {
+                    ListStyle::Custom(raw.trim_matches(['"', '\'']).to_string())
+                });
             }
             "text-indent" => {
                 if let Some(length) =

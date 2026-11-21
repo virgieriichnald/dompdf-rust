@@ -7,10 +7,11 @@ use ttf_parser::Face;
 
 use crate::css::{
     BackgroundAttachment, BackgroundBox, BackgroundRepeat, BackgroundSize, BorderCollapse,
-    BorderSpec, Clear, CounterStyle, CounterSystem, Display, Float, FontFace, Length, ListStyle,
-    MediaContext, PageRules, Position, PseudoElement, Rule, Style, TextAlign, VerticalAlign,
-    WhiteSpace, parse_color, parse_counter_styles, parse_font_faces, parse_length,
-    parse_page_rules, parse_styles, pseudo_style_for, px_scale, style_for,
+    BorderSpec, BorderStyle, BreakInside, Clear, CounterStyle, CounterSystem, Display, Float,
+    FontFace, Length, ListStyle, MediaContext, OutlineSpec, PageBreak, PageRules, Position,
+    PseudoElement, Rule, Style, TextAlign, TextTransform, VerticalAlign, WhiteSpace, WordBreak,
+    parse_color, parse_counter_styles, parse_font_faces, parse_length, parse_page_rules,
+    parse_styles, pseudo_style_for, px_scale, style_for,
 };
 use crate::{Options, PageTextLocation, ResourcePolicy, read_bytes};
 
@@ -220,12 +221,17 @@ struct BlockStyle {
     background_position_x_is_length: bool,
     background_position_y_is_length: bool,
     border: Option<BorderSpec>,
+    outline: Option<OutlineSpec>,
     padding_top: f32,
     padding_right: f32,
     padding_bottom: f32,
     padding_left: f32,
     content_width: Option<f32>,
     cursor_start: f32,
+    margin_top: f32,
+    margin_bottom: f32,
+    top_collapsible: bool,
+    bottom_collapsible: bool,
     opacity: f32,
     border_radius: [f32; 4],
 }
@@ -246,15 +252,63 @@ impl Default for BlockStyle {
             background_position_x_is_length: false,
             background_position_y_is_length: false,
             border: None,
+            outline: None,
             padding_top: 0.0,
             padding_right: 0.0,
             padding_bottom: 0.0,
             padding_left: 0.0,
             content_width: None,
             cursor_start: 0.0,
+            margin_top: 0.0,
+            margin_bottom: 0.0,
+            top_collapsible: false,
+            bottom_collapsible: false,
             opacity: 1.0,
             border_radius: [0.0; 4],
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockBreakState {
+    before: PageBreak,
+    inside: BreakInside,
+    orphans: u32,
+    widows: u32,
+    lines_on_page: usize,
+    widows_remaining: u32,
+}
+
+impl BlockBreakState {
+    fn from_style(style: &Style, before: PageBreak) -> Self {
+        Self {
+            before,
+            inside: style.page_break_inside,
+            orphans: style.orphans.max(1),
+            widows: style.widows.max(1),
+            lines_on_page: 0,
+            widows_remaining: 0,
+        }
+    }
+}
+
+fn combined_page_break(previous_after: PageBreak, before: PageBreak) -> PageBreak {
+    if previous_after.is_forced() || before.is_forced() {
+        PageBreak::Always
+    } else if previous_after.is_avoid() || before.is_avoid() {
+        PageBreak::Avoid
+    } else {
+        PageBreak::Auto
+    }
+}
+
+fn collapse_margin(first: f32, second: f32) -> f32 {
+    if first < 0.0 && second < 0.0 {
+        first.min(second)
+    } else if first < 0.0 || second < 0.0 {
+        first + second
+    } else {
+        first.max(second)
     }
 }
 
@@ -294,6 +348,7 @@ pub struct Line {
     pub background_position_y_is_length: bool,
     pub background_width: Option<f32>,
     pub border: Option<BorderSpec>,
+    pub outline: Option<OutlineSpec>,
     pub padding_top: f32,
     pub padding_right: f32,
     pub padding_bottom: f32,
@@ -308,7 +363,31 @@ pub struct Line {
 pub struct PageGeometry {
     pub width: f32,
     pub height: f32,
-    pub margin: f32,
+    pub margin_top: f32,
+    pub margin_right: f32,
+    pub margin_bottom: f32,
+    pub margin_left: f32,
+}
+
+impl PageGeometry {
+    fn uniform(width: f32, height: f32, margin: f32) -> Self {
+        Self {
+            width,
+            height,
+            margin_top: margin,
+            margin_right: margin,
+            margin_bottom: margin,
+            margin_left: margin,
+        }
+    }
+
+    fn content_width(&self) -> f32 {
+        (self.width - self.margin_left - self.margin_right).max(1.0)
+    }
+
+    fn content_height(&self) -> f32 {
+        (self.height - self.margin_top - self.margin_bottom).max(1.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -389,9 +468,25 @@ impl Document {
     pub fn from_html_with_options(html: &str, base: &Path, options: &Options) -> Self {
         let parsed = Html::parse_document(html);
         let base = resolve_base(&parsed, base);
-        let metadata = parse_metadata(&parsed);
+        let mut metadata = parse_metadata(&parsed);
         let lang = parse_lang(&parsed);
-        let scripts = collect_scripts(&parsed);
+        let scripts = if options.no_javascript {
+            Vec::new()
+        } else {
+            collect_scripts(&parsed)
+        };
+        if let Some(title) = &options.title {
+            metadata.title = Some(title.clone());
+        }
+        if let Some(author) = &options.author {
+            metadata.author = Some(author.clone());
+        }
+        if let Some(subject) = &options.subject {
+            metadata.subject = Some(subject.clone());
+        }
+        if let Some(keywords) = &options.keywords {
+            metadata.keywords = Some(keywords.clone());
+        }
         let mut options = options.clone();
         let provisional_media = MediaContext {
             media_type: "print".to_string(),
@@ -430,11 +525,7 @@ impl Document {
             containing_height: (options.height - 2.0 * options.margin).max(1.0),
             ..Style::default()
         };
-        let geometry = PageGeometry {
-            width: options.width,
-            height: options.height,
-            margin: options.margin,
-        };
+        let geometry = PageGeometry::uniform(options.width, options.height, options.margin);
         let mut collector = Collector::new(
             geometry,
             &base,
@@ -453,8 +544,15 @@ impl Document {
         collector.apply_geometry(initial_geometry);
 
         collector.load_fonts(&font_faces);
-        walk(parsed.root_element(), &base_style, &rules, &mut collector);
+        walk(
+            parsed.root_element(),
+            &base_style,
+            &rules,
+            &mut collector,
+            PageBreak::Auto,
+        );
         collector.flush_line();
+        collector.flush_pending_after();
 
         Document {
             pages: collector.pages,
@@ -800,6 +898,7 @@ struct Collector {
     page_rules: PageRules,
     page_name: Option<String>,
     pending_before: f32,
+    pending_after: f32,
     pending_indent: f32,
     offset_x: f32,
     offset_y: f32,
@@ -827,6 +926,9 @@ struct Collector {
     form_count: usize,
     counters: HashMap<String, Vec<i32>>,
     reset_stack: Vec<Vec<String>>,
+    break_stack: Vec<BlockBreakState>,
+    page_full: bool,
+    suppress_breaks: usize,
     px_scale: f32,
     image_byte_limit: Option<usize>,
     policy: ResourcePolicy,
@@ -843,8 +945,8 @@ impl Collector {
         page_rules: PageRules,
         counter_styles: Vec<CounterStyle>,
     ) -> Self {
-        let content_width = geometry.width - 2.0 * geometry.margin;
-        let content_height = geometry.height - 2.0 * geometry.margin;
+        let content_width = geometry.content_width();
+        let content_height = geometry.content_height();
         Self {
             pages: vec![Page {
                 lines: Vec::new(),
@@ -860,6 +962,7 @@ impl Collector {
             page_rules,
             page_name: None,
             pending_before: 0.0,
+            pending_after: 0.0,
             pending_indent: 0.0,
             offset_x: 0.0,
             offset_y: 0.0,
@@ -887,6 +990,9 @@ impl Collector {
             form_count: 0,
             counters: HashMap::new(),
             reset_stack: Vec::new(),
+            break_stack: Vec::new(),
+            page_full: false,
+            suppress_breaks: 0,
             px_scale,
             image_byte_limit,
             policy,
@@ -896,18 +1002,34 @@ impl Collector {
 
     fn geometry_for(&self, index: usize) -> PageGeometry {
         let rule = self.page_rules.for_index(index, self.page_name.as_deref());
+        let margins = rule.margins(self.default_geometry.margin_top);
         PageGeometry {
             width: rule.width.unwrap_or(self.default_geometry.width),
             height: rule.height.unwrap_or(self.default_geometry.height),
-            margin: rule.margin_points(self.default_geometry.margin),
+            margin_top: margins[0],
+            margin_right: margins[1],
+            margin_bottom: margins[2],
+            margin_left: margins[3],
         }
     }
 
     fn apply_geometry(&mut self, geometry: PageGeometry) {
-        self.max_width = geometry.width - 2.0 * geometry.margin;
-        self.page_height = geometry.height - 2.0 * geometry.margin;
+        self.max_width = geometry.content_width();
+        self.page_height = geometry.content_height();
         if self.current.is_empty() {
             self.line_max_width = self.max_width;
+        }
+    }
+
+    fn flush_pending_after(&mut self) {
+        let margin = self.pending_after;
+        if margin == 0.0 {
+            return;
+        }
+        self.pending_after = 0.0;
+        self.cursor += margin;
+        if let Some(last) = self.pages.last_mut().and_then(|page| page.lines.last_mut()) {
+            last.space_after += margin;
         }
     }
 
@@ -925,13 +1047,75 @@ impl Collector {
         self.float_right_bottom = 0.0;
         self.floats.clear();
         self.line_max_width = self.max_width;
+        for state in &mut self.break_stack {
+            state.lines_on_page = 0;
+            state.widows_remaining = 0;
+        }
     }
 
     fn page_is_empty(&self) -> bool {
         self.pages.last().is_some_and(|page| page.lines.is_empty())
     }
 
+    fn break_for_overflow(&mut self) {
+        let widows = self
+            .break_stack
+            .iter()
+            .map(|state| state.widows)
+            .collect::<Vec<_>>();
+        self.new_page();
+        for (state, widows) in self.break_stack.iter_mut().zip(widows) {
+            state.widows_remaining = widows;
+        }
+    }
+
+    fn force_page_break(&mut self) {
+        self.pending_after = 0.0;
+        self.flush_line();
+        if !self.page_is_empty() {
+            self.new_page();
+            self.pending_before = 0.0;
+            self.page_full = true;
+        }
+    }
+
+    fn check_forced_page_break(&mut self, tag: &str, break_before: PageBreak) {
+        if self.page_full || self.suppress_breaks > 0 || tag == "body" || !break_before.is_forced()
+        {
+            return;
+        }
+        self.force_page_break();
+    }
+
+    fn page_break_allowed(&self) -> bool {
+        if self.suppress_breaks > 0 {
+            return true;
+        }
+        let Some(top) = self.break_stack.last() else {
+            return true;
+        };
+        if top.widows_remaining > 0 {
+            return false;
+        }
+        if top.before.is_avoid() && top.lines_on_page == 0 {
+            return false;
+        }
+        for state in &self.break_stack {
+            if state.lines_on_page > 0 && state.lines_on_page < state.orphans as usize {
+                return false;
+            }
+            if state.inside.is_avoid()
+                && state.lines_on_page > 0
+                && state.lines_on_page < state.orphans as usize
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn push_line(&mut self, mut line: Line) {
+        self.flush_pending_after();
         if line.background.is_none() {
             line.background = self.block.background;
             line.background_alpha = self.block.background_alpha;
@@ -954,6 +1138,9 @@ impl Collector {
         }
         if line.border.is_none() {
             line.border = self.block.border;
+        }
+        if line.outline.is_none() {
+            line.outline = self.block.outline;
         }
         line.opacity *= self.block.opacity;
         if line.border_radius.iter().all(|radius| *radius == 0.0) {
@@ -983,12 +1170,21 @@ impl Collector {
             line.links = collect_links(&line.items);
         }
         self.pages.last_mut().expect("page exists").lines.push(line);
+        for state in &mut self.break_stack {
+            state.lines_on_page += 1;
+            state.widows_remaining = state.widows_remaining.saturating_sub(1);
+        }
+        self.page_full = false;
     }
 
     fn emit_line(&mut self, mut line: Line) {
+        self.flush_pending_after();
         let needed = line.space_before + line.height + line.space_after;
-        if self.cursor + needed > self.page_height && !self.page_is_empty() {
-            self.new_page();
+        if self.cursor + needed > self.page_height
+            && !self.page_is_empty()
+            && self.page_break_allowed()
+        {
+            self.break_for_overflow();
             line.space_before = 0.0;
         }
 
@@ -1003,8 +1199,12 @@ impl Collector {
     }
 
     fn reserve(&mut self, height: f32, space_before: f32) -> f32 {
-        if self.cursor + space_before + height > self.page_height && !self.page_is_empty() {
-            self.new_page();
+        self.flush_pending_after();
+        if self.cursor + space_before + height > self.page_height
+            && !self.page_is_empty()
+            && self.page_break_allowed()
+        {
+            self.break_for_overflow();
         }
         self.cursor += space_before;
         let top = self.cursor;
@@ -1040,6 +1240,7 @@ impl Collector {
             background_position_y_is_length: false,
             background_width: None,
             border: None,
+            outline: None,
             padding_top: 0.0,
             padding_right: 0.0,
             padding_bottom: 0.0,
@@ -1056,8 +1257,22 @@ impl Collector {
         self.emit_line(line);
     }
 
-    fn start_block(&mut self, style: &Style) {
+    fn start_block(&mut self, style: &Style, break_before: PageBreak) {
+        let previous_bottom = if self.current.is_empty() {
+            std::mem::replace(&mut self.pending_after, 0.0)
+        } else {
+            0.0
+        };
         self.flush_line();
+        let mut used_top = collapse_margin(previous_bottom, style.margin_top_pt());
+        if self.block.top_collapsible {
+            self.pending_before -= self.block.margin_top;
+            used_top = collapse_margin(self.block.margin_top, used_top);
+        }
+        self.pending_before += used_top;
+        self.block.top_collapsible = false;
+        self.break_stack
+            .push(BlockBreakState::from_style(style, break_before));
         self.style_stack.push(self.block.clone());
         self.block.cursor_start = self.cursor;
         self.block.content_width = style.width_pt();
@@ -1125,11 +1340,28 @@ impl Collector {
         if style.border.is_some() {
             self.block.border = style.border;
         }
+        if style.outline.is_some() {
+            self.block.outline = style.outline;
+        }
         self.block.opacity *= style.opacity;
         if style.border_radius.iter().any(|radius| *radius > 0.0) {
             self.block.border_radius = style.border_radius;
         }
-        self.pending_before = self.pending_before.max(style.margin_top_pt());
+        let in_flow = !matches!(style.position, Position::Absolute | Position::Fixed)
+            && style.float == Float::None;
+        let no_top_border = !style
+            .border
+            .as_ref()
+            .is_some_and(|border| border.top && border.width > 0.0);
+        let no_bottom_border = !style
+            .border
+            .as_ref()
+            .is_some_and(|border| border.bottom && border.width > 0.0);
+        self.block.margin_top = used_top;
+        self.block.margin_bottom = 0.0;
+        self.block.top_collapsible = in_flow && style.padding_top_pt() == 0.0 && no_top_border;
+        self.block.bottom_collapsible =
+            in_flow && style.padding_bottom_pt() == 0.0 && no_bottom_border;
         self.pending_indent = style.text_indent_pt();
         self.align = style.text_align;
     }
@@ -1147,10 +1379,13 @@ impl Collector {
             }
         }
         let margin = style.margin_bottom_pt();
-        if let Some(last) = self.pages.last_mut().and_then(|page| page.lines.last_mut()) {
-            last.space_after = last.space_after.max(margin);
+        if self.block.bottom_collapsible {
+            self.pending_after = collapse_margin(self.pending_after, margin);
+        } else {
+            self.flush_pending_after();
+            self.pending_after = margin;
         }
-        self.cursor += margin;
+        self.break_stack.pop();
         if let Some(block) = self.style_stack.pop() {
             self.block = block;
         }
@@ -1209,10 +1444,38 @@ impl Collector {
             .unwrap_or(FontId::Builtin(kind))
     }
 
+    fn transform_text(&self, text: &str, style: &Style) -> String {
+        match style.text_transform {
+            TextTransform::None => text.to_string(),
+            TextTransform::Uppercase => text.chars().flat_map(char::to_uppercase).collect(),
+            TextTransform::Lowercase => text.chars().flat_map(char::to_lowercase).collect(),
+            TextTransform::Capitalize => {
+                let mut output = String::new();
+                let mut start = true;
+                for ch in text.chars() {
+                    if ch.is_whitespace() {
+                        output.push(ch);
+                        start = true;
+                    } else if start {
+                        output.extend(ch.to_uppercase());
+                        start = false;
+                    } else {
+                        output.extend(ch.to_lowercase());
+                    }
+                }
+                output
+            }
+        }
+    }
+
     fn text_width(&self, text: &str, style: &Style) -> f32 {
         let spacing = style.letter_spacing_pt();
         measure(text, style.font_size, self.font_id(style), &self.fonts)
             + spacing * text.chars().count() as f32
+    }
+
+    fn space_width(&self, style: &Style) -> f32 {
+        self.text_width(" ", style) + style.word_spacing_pt()
     }
 
     fn prepare_line(&mut self, line_height: f32) {
@@ -1243,12 +1506,14 @@ impl Collector {
     }
 
     fn push_text(&mut self, text: &str, style: &Style) {
+        let transformed = self.transform_text(text, style);
+        let text = transformed.as_str();
         if style.white_space == WhiteSpace::Pre {
             self.push_text_pre(text, style);
             return;
         }
 
-        let space_width = self.text_width(" ", style);
+        let space_width = self.space_width(style);
         let wrap = style.white_space != WhiteSpace::Nowrap;
 
         let line_height = style.font_size * style.line_height;
@@ -1273,13 +1538,44 @@ impl Collector {
                 self.push_run(" ", style, space_width);
             }
 
-            self.push_run(word, style, word_width);
+            let breakable = matches!(
+                style.word_break,
+                WordBreak::BreakWord | WordBreak::Anywhere | WordBreak::BreakAll
+            );
+            if wrap && breakable && self.width + word_width > self.line_max_width {
+                self.push_wrapped_word(word, style, line_height);
+            } else {
+                self.push_run(word, style, word_width);
+            }
             self.height = self.height.max(style.font_size * style.line_height);
         }
     }
 
+    fn push_wrapped_word(&mut self, word: &str, style: &Style, line_height: f32) {
+        let mut chunk = String::new();
+        for ch in word.chars() {
+            chunk.push(ch);
+            let width = self.text_width(&chunk, style);
+            if self.width + width > self.line_max_width && chunk.chars().count() > 1 {
+                chunk.pop();
+                let width = self.text_width(&chunk, style);
+                self.push_run(&chunk, style, width);
+                self.flush_line();
+                self.prepare_line(line_height);
+                chunk.clear();
+                chunk.push(ch);
+            }
+        }
+        if !chunk.is_empty() {
+            let width = self.text_width(&chunk, style);
+            self.push_run(&chunk, style, width);
+        }
+    }
+
     fn push_text_pre(&mut self, text: &str, style: &Style) {
-        let space_width = self.text_width(" ", style);
+        let transformed = self.transform_text(text, style);
+        let text = transformed.as_str();
+        let space_width = self.space_width(style);
         let mut word = String::new();
 
         for ch in text.chars() {
@@ -2224,6 +2520,9 @@ fn load_font(family: &str, bytes: &[u8], bold: bool, italic: bool) -> Option<Emb
         let Some(glyph) = face.glyph_index(ch) else {
             continue;
         };
+        if glyph.0 == 0 {
+            continue;
+        }
         let width = face.glyph_hor_advance(glyph).unwrap_or(0) as f32 / units_per_em as f32;
         advance.insert(ch, width);
         glyphs.insert(ch, glyph.0);
@@ -2574,17 +2873,28 @@ fn normalize_title(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Collector) {
+fn walk(
+    element: ElementRef,
+    parent: &Style,
+    rules: &[Rule],
+    collector: &mut Collector,
+    previous_after: PageBreak,
+) -> PageBreak {
     let tag = element.value().name();
 
     if matches!(
         tag,
         "head" | "title" | "meta" | "link" | "script" | "style" | "noscript" | "template"
     ) {
-        return;
+        return previous_after;
     }
 
     let mut style = style_for(&element, parent, rules);
+    let effective_after = if tag == "body" {
+        PageBreak::Auto
+    } else {
+        style.page_break_after
+    };
 
     if collector.page_name.is_none()
         && let Some(name) = &style.page_name
@@ -2605,6 +2915,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             width,
             color: [0.0, 0.0, 0.0],
             alpha: 1.0,
+            style: BorderStyle::Solid,
             top: true,
             right: true,
             bottom: true,
@@ -2626,8 +2937,18 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     }
 
     if style.display == Display::None {
-        return;
+        return previous_after;
     }
+
+    let break_before = if tag == "body"
+        || matches!(style.position, Position::Absolute | Position::Fixed)
+        || style.float != Float::None
+    {
+        PageBreak::Auto
+    } else {
+        combined_page_break(previous_after, style.page_break_before)
+    };
+    collector.check_forced_page_break(tag, break_before);
 
     let previous_link = collector.link.clone();
     if tag == "a" {
@@ -2660,13 +2981,13 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if style.float != Float::None {
         layout_float(&element, &style, rules, collector);
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         layout_overlay(&element, &style, rules, collector, None);
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     if let Some(level) = heading_level(tag) {
@@ -2686,14 +3007,14 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     if tag == "br" {
         collector.flush_line();
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     if matches!(tag, "input" | "textarea" | "select" | "button") {
         let input_type = element.attr("type").unwrap_or("text").to_ascii_lowercase();
         if tag == "input" && input_type == "hidden" {
             collector.link = previous_link;
-            return;
+            return effective_after;
         }
         let mut width = 120.0;
         let mut height = 20.0;
@@ -2703,7 +3024,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         collector.form_count += 1;
         collector.push_form_item(control, width, height, &style);
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     if tag == "img" {
@@ -2721,7 +3042,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         });
         collector.push_image(src, alt, width, height, &style);
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     if tag == "svg" {
@@ -2741,13 +3062,13 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
             collector.push_image_item(index, width, height, &style);
         }
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
-    if tag == "table" {
-        layout_table(&element, &style, rules, collector);
+    if style.display == Display::Table {
+        layout_table(&element, &style, rules, collector, break_before);
         collector.link = previous_link;
-        return;
+        return effective_after;
     }
 
     let starts_list = matches!(tag, "ul" | "ol");
@@ -2768,9 +3089,16 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         });
     }
 
-    let is_block = style.display == Display::Block;
+    let is_block = matches!(
+        style.display,
+        Display::Block
+            | Display::ListItem
+            | Display::TableRow
+            | Display::TableCell
+            | Display::TableHeaderGroup
+    );
     if is_block {
-        collector.start_block(&style);
+        collector.start_block(&style, break_before);
         if let Some(width) = collector.block.content_width {
             style.containing_width = width;
         }
@@ -2783,11 +3111,11 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         Some(4) => StructureRole::Heading4,
         Some(5) => StructureRole::Heading5,
         Some(6) => StructureRole::Heading6,
-        _ if tag == "li" => StructureRole::ListItem,
+        _ if style.display == Display::ListItem => StructureRole::ListItem,
         _ => collector.struct_role,
     };
 
-    if tag == "li" {
+    if style.display == Display::ListItem {
         let prefix = collector
             .lists
             .last_mut()
@@ -2829,9 +3157,16 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
         collector.push_text(content, &before_style);
     }
 
+    let mut previous_child_after = PageBreak::Auto;
     for child in element.children() {
         if let Some(child_element) = ElementRef::wrap(child) {
-            walk(child_element, &style, rules, collector);
+            previous_child_after = walk(
+                child_element,
+                &style,
+                rules,
+                collector,
+                previous_child_after,
+            );
         } else if let Some(text) = child.value().as_text() {
             collector.push_text(text, &style);
         }
@@ -2850,6 +3185,7 @@ fn walk(element: ElementRef, parent: &Style, rules: &[Rule], collector: &mut Col
     }
     collector.struct_role = previous_struct_role;
     collector.link = previous_link;
+    effective_after
 }
 
 #[derive(Clone)]
@@ -2959,6 +3295,7 @@ fn emit_prepared_row(
             background_position_y_is_length: cell.style.background_position_y_is_length,
             background_width: Some(cell_width),
             border: cell.style.border,
+            outline: cell.style.outline,
             padding_top,
             padding_right,
             padding_bottom,
@@ -2984,12 +3321,29 @@ fn layout_table<'a>(
     style: &Style,
     rules: &[Rule],
     collector: &mut Collector,
+    break_before: PageBreak,
 ) {
-    let row_selector = Selector::parse("tr").expect("valid selector");
-    let rows = table.select(&row_selector).collect::<Vec<_>>();
+    let rows = table
+        .descendants()
+        .filter_map(ElementRef::wrap)
+        .filter(|row| {
+            style_for(row, style, rules).display == Display::TableRow
+                && !row
+                    .ancestors()
+                    .filter_map(ElementRef::wrap)
+                    .any(|ancestor| {
+                        !std::ptr::eq(ancestor.value(), table.value())
+                            && style_for(&ancestor, style, rules).display == Display::Table
+                    })
+        })
+        .collect::<Vec<_>>();
     if rows.is_empty() {
         return;
     }
+
+    collector
+        .break_stack
+        .push(BlockBreakState::from_style(style, break_before));
 
     let table_background = table.attr("bgcolor").and_then(parse_color);
     let cell_padding = table.attr("cellpadding").and_then(parse_length);
@@ -3004,10 +3358,11 @@ fn layout_table<'a>(
     let mut column_count = 0usize;
 
     for row in &rows {
+        let row_style = style_for(row, style, rules);
         let cells = row
             .children()
             .filter_map(ElementRef::wrap)
-            .filter(|cell| matches!(cell.value().name(), "td" | "th"))
+            .filter(|cell| style_for(cell, &row_style, rules).display == Display::TableCell)
             .collect::<Vec<_>>();
         column_count = column_count.max(cells.len());
         grid.push(vec![None; column_count.max(1)]);
@@ -3020,10 +3375,11 @@ fn layout_table<'a>(
     }
 
     for (row_index, row) in rows.iter().enumerate() {
+        let row_style = style_for(row, style, rules);
         for cell in row
             .children()
             .filter_map(ElementRef::wrap)
-            .filter(|cell| matches!(cell.value().name(), "td" | "th"))
+            .filter(|cell| style_for(cell, &row_style, rules).display == Display::TableCell)
         {
             while cursors[row_index] < column_count && grid[row_index][cursors[row_index]].is_some()
             {
@@ -3093,13 +3449,28 @@ fn layout_table<'a>(
             .collect::<Vec<_>>()
     };
     let table_space = style.margin_top_pt();
-    let header_ptrs = table
-        .select(&Selector::parse("thead tr").expect("valid selector"))
+    let header_ptrs = rows
+        .iter()
+        .filter(|row| {
+            row.ancestors()
+                .filter_map(ElementRef::wrap)
+                .any(|ancestor| {
+                    style_for(&ancestor, style, rules).display == Display::TableHeaderGroup
+                })
+                || style_for(row, style, rules).display == Display::TableHeaderGroup
+        })
         .map(|row| row.value() as *const _ as usize)
         .collect::<HashSet<_>>();
     let mut header_row: Option<PreparedRow> = None;
 
+    let mut previous_row_after = PageBreak::Auto;
     for row_index in 0..grid.len() {
+        let row_style = style_for(&rows[row_index], style, rules);
+        let row_before = combined_page_break(previous_row_after, row_style.page_break_before);
+        collector.check_forced_page_break("tr", row_before);
+        collector
+            .break_stack
+            .push(BlockBreakState::from_style(&row_style, row_before));
         let mut prepared = PreparedRow {
             height: 0.0,
             cells: Vec::new(),
@@ -3135,11 +3506,13 @@ fn layout_table<'a>(
             let saved_cursor = collector.cursor;
             let saved_align = collector.align;
             let saved_pending = collector.pending_before;
+            let saved_pending_after = collector.pending_after;
             let saved_block = collector.block.clone();
             let saved_stack_len = collector.style_stack.len();
             let saved_pages = collector.pages.len();
             let saved_anchors = collector.anchors.len();
             let saved_bookmarks = collector.bookmarks.len();
+            let saved_break_stack = collector.break_stack.clone();
 
             collector.max_width = content_width;
             collector.page_height = f32::MAX;
@@ -3149,20 +3522,29 @@ fn layout_table<'a>(
             collector.pending_before = 0.0;
             collector.block = BlockStyle::default();
 
+            collector.suppress_breaks += 1;
             for child in cell.element.children() {
                 if let Some(child_element) = ElementRef::wrap(child) {
-                    walk(child_element, &cell_style, rules, collector);
+                    walk(
+                        child_element,
+                        &cell_style,
+                        rules,
+                        collector,
+                        PageBreak::Auto,
+                    );
                 } else if let Some(text) = child.value().as_text() {
                     collector.push_text(text, &cell_style);
                 }
             }
             collector.flush_line();
+            collector.suppress_breaks -= 1;
 
             let mut lines = collector.pages.pop().expect("cell page").lines;
             for line in &mut lines {
                 line.background = None;
                 line.background_image = None;
                 line.border = None;
+                line.outline = None;
                 line.background_width = None;
                 line.opacity *= cell_style.opacity;
                 line.border_radius = cell_style.border_radius;
@@ -3171,11 +3553,13 @@ fn layout_table<'a>(
             collector.anchors.truncate(saved_anchors);
             collector.bookmarks.truncate(saved_bookmarks);
             collector.style_stack.truncate(saved_stack_len);
+            collector.break_stack = saved_break_stack;
             collector.max_width = saved_max;
             collector.page_height = saved_page_height;
             collector.cursor = saved_cursor;
             collector.align = saved_align;
             collector.pending_before = saved_pending;
+            collector.pending_after = saved_pending_after;
             collector.block = saved_block;
 
             let content_height = lines
@@ -3214,7 +3598,10 @@ fn layout_table<'a>(
         if is_header && header_row.is_none() {
             header_row = Some(prepared);
         }
+        collector.break_stack.pop();
+        previous_row_after = row_style.page_break_after;
     }
+    collector.break_stack.pop();
 }
 
 fn layout_float<'a>(
@@ -3238,6 +3625,7 @@ fn layout_overlay<'a>(
     let saved_cursor = collector.cursor;
     let saved_align = collector.align;
     let saved_pending = collector.pending_before;
+    let saved_pending_after = collector.pending_after;
     let saved_block = collector.block.clone();
     let saved_stack_len = collector.style_stack.len();
     let saved_pages = collector.pages.len();
@@ -3246,6 +3634,7 @@ fn layout_overlay<'a>(
     let saved_line_max_width = collector.line_max_width;
     let saved_anchors = collector.anchors.len();
     let saved_bookmarks = collector.bookmarks.len();
+    let saved_break_stack = collector.break_stack.clone();
 
     let content_width = collector.max_width.max(1.0);
     collector.max_width = content_width;
@@ -3271,24 +3660,31 @@ fn layout_overlay<'a>(
         background_position_x_is_length: style.background_position_x_is_length,
         background_position_y_is_length: style.background_position_y_is_length,
         border: style.border,
+        outline: style.outline,
         padding_top: style.padding_top_pt(),
         padding_right: style.padding_right_pt(),
         padding_bottom: style.padding_bottom_pt(),
         padding_left: style.padding_left_pt(),
         content_width: Some(style.width_pt().unwrap_or(content_width)),
         cursor_start: 0.0,
+        margin_top: 0.0,
+        margin_bottom: 0.0,
+        top_collapsible: false,
+        bottom_collapsible: false,
         opacity: style.opacity,
         border_radius: style.border_radius,
     };
 
+    collector.suppress_breaks += 1;
     for child in element.children() {
         if let Some(child_element) = ElementRef::wrap(child) {
-            walk(child_element, style, rules, collector);
+            walk(child_element, style, rules, collector, PageBreak::Auto);
         } else if let Some(text) = child.value().as_text() {
             collector.push_text(text, style);
         }
     }
     collector.flush_line();
+    collector.suppress_breaks -= 1;
 
     let mut lines = collector.pages.pop().expect("overlay page").lines;
     for line in &mut lines {
@@ -3298,6 +3694,7 @@ fn layout_overlay<'a>(
     collector.anchors.truncate(saved_anchors);
     collector.bookmarks.truncate(saved_bookmarks);
     collector.style_stack.truncate(saved_stack_len);
+    collector.break_stack = saved_break_stack;
     collector.max_width = saved_max;
     collector.page_height = saved_page_height;
     collector.floats = saved_floats;
@@ -3306,6 +3703,7 @@ fn layout_overlay<'a>(
     collector.cursor = saved_cursor;
     collector.align = saved_align;
     collector.pending_before = saved_pending;
+    collector.pending_after = saved_pending_after;
     collector.block = saved_block;
 
     let margin_left = style.margin_left_pt();
@@ -3416,6 +3814,7 @@ fn layout_overlay<'a>(
             background_position_y_is_length: style.background_position_y_is_length,
             background_width: Some(box_width),
             border: style.border,
+            outline: style.outline,
             padding_top,
             padding_right,
             padding_bottom,

@@ -26,6 +26,12 @@ fn help() {
     println!("  --owner-password PASSWORD  Separate owner password");
     println!("  --pdf-a        Add basic PDF/A-1b output intent and XMP metadata");
     println!("  --pdf-ua       Mark output as tagged PDF/UA-1");
+    println!("  --title TEXT   Override PDF title metadata");
+    println!("  --author TEXT  Override PDF author metadata");
+    println!("  --subject TEXT  Override PDF subject metadata");
+    println!("  --keywords TEXT  Override PDF keywords metadata");
+    println!("  --no-javascript  Omit document and inline JavaScript");
+    println!("  --encoding NAME  Input encoding: UTF-8, ASCII, Windows-1252 (default: UTF-8)");
     println!("  --help         Show this help");
 }
 
@@ -146,6 +152,37 @@ fn parse_args() -> io::Result<(Options, String, String)> {
             }
             "--pdf-a" => options = options.pdf_a(),
             "--pdf-ua" => options = options.pdf_ua(),
+            "--title" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--title needs a value")
+                })?;
+                options = options.title(&value);
+            }
+            "--author" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--author needs a value")
+                })?;
+                options = options.author(&value);
+            }
+            "--subject" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--subject needs a value")
+                })?;
+                options = options.subject(&value);
+            }
+            "--keywords" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--keywords needs a value")
+                })?;
+                options = options.keywords(&value);
+            }
+            "--no-javascript" => options = options.no_javascript(),
+            "--encoding" => {
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--encoding needs a value")
+                })?;
+                options = options.encoding(&value);
+            }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -180,13 +217,14 @@ fn main() -> io::Result<()> {
             .unwrap_or_else(|| PathBuf::from("."))
     };
 
-    let html = if input == "-" {
-        let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer)?;
+    let bytes = if input == "-" {
+        let mut buffer = Vec::new();
+        io::stdin().read_to_end(&mut buffer)?;
         buffer
     } else {
-        fs::read_to_string(&input)?
+        fs::read(&input)?
     };
+    let html = html2pdf_rs::decode_html_bytes(&bytes, &options.encoding);
 
     let pdf = html2pdf_rs::render_html_with_options(&html, &base, &options);
     let mut file = fs::File::create(output)?;

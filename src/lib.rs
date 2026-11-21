@@ -155,6 +155,12 @@ pub struct Options {
     pub aes_encrypt: bool,
     pub pdf_a: bool,
     pub pdf_ua: bool,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+    pub no_javascript: bool,
+    pub encoding: String,
 }
 
 impl Default for Options {
@@ -174,6 +180,12 @@ impl Default for Options {
             aes_encrypt: false,
             pdf_a: false,
             pdf_ua: false,
+            title: None,
+            author: None,
+            subject: None,
+            keywords: None,
+            no_javascript: false,
+            encoding: "UTF-8".to_string(),
         }
     }
 }
@@ -270,6 +282,38 @@ impl Options {
         self.pdf_ua = true;
         self
     }
+
+    pub fn title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
+    pub fn author(mut self, author: &str) -> Self {
+        self.author = Some(author.to_string());
+        self
+    }
+
+    pub fn subject(mut self, subject: &str) -> Self {
+        self.subject = Some(subject.to_string());
+        self
+    }
+
+    pub fn keywords(mut self, keywords: &str) -> Self {
+        self.keywords = Some(keywords.to_string());
+        self
+    }
+
+    pub fn no_javascript(mut self) -> Self {
+        self.no_javascript = true;
+        self
+    }
+
+    pub fn encoding(mut self, encoding: &str) -> Self {
+        if !encoding.trim().is_empty() {
+            self.encoding = encoding.trim().to_string();
+        }
+        self
+    }
 }
 
 pub fn render_html(html: &str) -> Vec<u8> {
@@ -283,4 +327,49 @@ pub fn render_html_with_base(html: &str, base: &Path) -> Vec<u8> {
 pub fn render_html_with_options(html: &str, base: &Path, options: &Options) -> Vec<u8> {
     let document = layout::Document::from_html_with_options(html, base, options);
     pdf::write_pdf(&document)
+}
+
+const CP1252_HIGH: [char; 32] = [
+    '\u{20ac}', '\u{fffd}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffd}', '\u{017d}', '\u{fffd}',
+    '\u{fffd}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}', '\u{0153}', '\u{fffd}', '\u{017e}', '\u{0178}',
+];
+
+pub fn decode_html_bytes(bytes: &[u8], encoding: &str) -> String {
+    match encoding
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "")
+        .as_str()
+    {
+        "ascii" | "usascii" => bytes
+            .iter()
+            .map(|&byte| {
+                if byte < 0x80 {
+                    byte as char
+                } else {
+                    '\u{fffd}'
+                }
+            })
+            .collect(),
+        "windows1252" | "cp1252" | "iso88591" | "latin1" => bytes
+            .iter()
+            .map(|&byte| {
+                if byte < 0x80 {
+                    byte as char
+                } else if byte < 0xa0 {
+                    CP1252_HIGH[(byte - 0x80) as usize]
+                } else {
+                    char::from_u32(byte as u32).unwrap_or('\u{fffd}')
+                }
+            })
+            .collect(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+pub fn render_html_bytes_with_options(bytes: &[u8], base: &Path, options: &Options) -> Vec<u8> {
+    let html = decode_html_bytes(bytes, &options.encoding);
+    render_html_with_options(&html, base, options)
 }

@@ -31,7 +31,32 @@ pub fn px_scale(dpi: f32) -> f32 {
 pub enum Display {
     Block,
     Inline,
+    InlineBlock,
+    Table,
+    TableRow,
+    TableCell,
+    TableHeaderGroup,
+    ListItem,
     None,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    BreakWord,
+    Anywhere,
+    BreakAll,
+    KeepAll,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Capitalize,
+    Uppercase,
+    Lowercase,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,11 +110,53 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageBreak {
+    #[default]
+    Auto,
+    Always,
+    Avoid,
+}
+
+impl PageBreak {
+    pub fn is_forced(self) -> bool {
+        matches!(self, Self::Always)
+    }
+
+    pub fn is_avoid(self) -> bool {
+        matches!(self, Self::Avoid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BreakInside {
+    #[default]
+    Auto,
+    Avoid,
+}
+
+impl BreakInside {
+    pub fn is_avoid(self) -> bool {
+        matches!(self, Self::Avoid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    #[default]
+    Solid,
+    Dotted,
+    Dashed,
+    Double,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BorderSpec {
     pub width: f32,
     pub color: [f32; 3],
     pub alpha: f32,
+    pub style: BorderStyle,
     pub top: bool,
     pub right: bool,
     pub bottom: bool,
@@ -102,10 +169,32 @@ impl Default for BorderSpec {
             width: 1.0,
             color: [0.0, 0.0, 0.0],
             alpha: 1.0,
+            style: BorderStyle::Solid,
             top: true,
             right: true,
             bottom: true,
             left: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutlineSpec {
+    pub width: f32,
+    pub color: [f32; 3],
+    pub alpha: f32,
+    pub style: BorderStyle,
+    pub offset: f32,
+}
+
+impl Default for OutlineSpec {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            color: [0.0, 0.0, 0.0],
+            alpha: 1.0,
+            style: BorderStyle::Solid,
+            offset: 0.0,
         }
     }
 }
@@ -167,19 +256,13 @@ impl PageRule {
         }
     }
 
-    pub fn margin_points(&self, fallback: f32) -> f32 {
-        let sides = [
-            self.margin_top.or(self.margin),
-            self.margin_right.or(self.margin),
-            self.margin_bottom.or(self.margin),
-            self.margin_left.or(self.margin),
-        ];
-        let specified = sides.into_iter().flatten().collect::<Vec<_>>();
-        if specified.is_empty() {
-            fallback
-        } else {
-            specified.iter().sum::<f32>() / specified.len() as f32
-        }
+    pub fn margins(&self, fallback: f32) -> [f32; 4] {
+        [
+            self.margin_top.or(self.margin).unwrap_or(fallback),
+            self.margin_right.or(self.margin).unwrap_or(fallback),
+            self.margin_bottom.or(self.margin).unwrap_or(fallback),
+            self.margin_left.or(self.margin).unwrap_or(fallback),
+        ]
     }
 }
 
@@ -292,6 +375,7 @@ pub struct Style {
     pub background_position_x_is_length: bool,
     pub background_position_y_is_length: bool,
     pub border: Option<BorderSpec>,
+    pub outline: Option<OutlineSpec>,
     pub opacity: f32,
     pub border_radius: [f32; 4],
     pub border_collapse: BorderCollapse,
@@ -305,7 +389,15 @@ pub struct Style {
     pub list_style: ListStyle,
     pub text_indent: Length,
     pub letter_spacing: Length,
+    pub word_spacing: Length,
+    pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
+    pub word_break: WordBreak,
+    pub page_break_before: PageBreak,
+    pub page_break_after: PageBreak,
+    pub page_break_inside: BreakInside,
+    pub orphans: u32,
+    pub widows: u32,
     pub page_name: Option<String>,
     pub content: Option<String>,
     pub counter_reset: Vec<(String, i32)>,
@@ -362,6 +454,7 @@ impl Default for Style {
             background_position_x_is_length: false,
             background_position_y_is_length: false,
             border: None,
+            outline: None,
             opacity: 1.0,
             border_radius: [0.0; 4],
             border_collapse: BorderCollapse::Separate,
@@ -375,7 +468,15 @@ impl Default for Style {
             list_style: ListStyle::Disc,
             text_indent: Length::default(),
             letter_spacing: Length::default(),
+            word_spacing: Length::default(),
+            text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
+            word_break: WordBreak::Normal,
+            page_break_before: PageBreak::Auto,
+            page_break_after: PageBreak::Auto,
+            page_break_inside: BreakInside::Auto,
+            orphans: 2,
+            widows: 2,
             page_name: None,
             content: None,
             counter_reset: Vec::new(),
@@ -413,7 +514,12 @@ impl Style {
             list_style: parent.list_style.clone(),
             text_indent: parent.text_indent,
             letter_spacing: parent.letter_spacing,
+            word_spacing: parent.word_spacing,
+            text_transform: parent.text_transform,
             white_space: parent.white_space,
+            word_break: parent.word_break,
+            orphans: parent.orphans,
+            widows: parent.widows,
             page_name: parent.page_name.clone(),
             variables: parent.variables.clone(),
             ..Self::default()
@@ -467,6 +573,11 @@ impl Style {
 
     pub fn letter_spacing_pt(&self) -> f32 {
         self.letter_spacing
+            .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
+    }
+
+    pub fn word_spacing_pt(&self) -> f32 {
+        self.word_spacing
             .resolve_with_size(self.font_size, self.containing_width, self.px_scale)
     }
 
@@ -1859,6 +1970,31 @@ fn apply_style_declarations(
                     style.page_name = Some(name);
                 }
             }
+            "page-break-before" | "break-before" => {
+                if let Some(value) = parse_page_break(value) {
+                    style.page_break_before = value;
+                }
+            }
+            "page-break-after" | "break-after" => {
+                if let Some(value) = parse_page_break(value) {
+                    style.page_break_after = value;
+                }
+            }
+            "page-break-inside" | "break-inside" => {
+                if let Some(value) = parse_break_inside(value) {
+                    style.page_break_inside = value;
+                }
+            }
+            "orphans" => {
+                if let Some(value) = parse_positive_u32(value) {
+                    style.orphans = value;
+                }
+            }
+            "widows" => {
+                if let Some(value) = parse_positive_u32(value) {
+                    style.widows = value;
+                }
+            }
             "position" => {
                 style.position = match value.trim().to_ascii_lowercase().as_str() {
                     "relative" => Position::Relative,
@@ -2136,6 +2272,75 @@ fn apply_style_declarations(
                     }
                 }
             }
+            "outline" => {
+                let lower = value.to_ascii_lowercase();
+                if lower.contains("none") || lower.contains("hidden") {
+                    style.outline = None;
+                } else if let Some(parsed) =
+                    parse_outline(value, style.font_size, containing_width, style.px_scale)
+                {
+                    style.outline = Some(parsed);
+                }
+            }
+            "outline-width" => {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
+                    let outline = style.outline.get_or_insert_with(OutlineSpec::default);
+                    outline.width = length.resolve_with_size(
+                        style.font_size,
+                        style.containing_width,
+                        style.px_scale,
+                    );
+                }
+            }
+            "outline-style" => {
+                if let Some(parsed) = parse_border_style(value) {
+                    if parsed == BorderStyle::None {
+                        style.outline = None;
+                    } else {
+                        style.outline.get_or_insert_with(OutlineSpec::default).style = parsed;
+                    }
+                }
+            }
+            "outline-color" => {
+                if let Some(color) = parse_color(value) {
+                    let outline = style.outline.get_or_insert_with(OutlineSpec::default);
+                    outline.color = color;
+                    outline.alpha = parse_color_alpha(value).unwrap_or(1.0);
+                }
+            }
+            "outline-offset" => {
+                if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
+                    let outline = style.outline.get_or_insert_with(OutlineSpec::default);
+                    outline.offset = length.resolve_with_size(
+                        style.font_size,
+                        style.containing_width,
+                        style.px_scale,
+                    );
+                }
+            }
+            "border-style" => {
+                if let Some(parsed) = parse_border_style(value) {
+                    if parsed == BorderStyle::None {
+                        if let Some(border) = style.border.as_mut() {
+                            border.top = false;
+                            border.right = false;
+                            border.bottom = false;
+                            border.left = false;
+                        }
+                    } else if let Some(border) = style.border.as_mut() {
+                        border.style = parsed;
+                    } else {
+                        style.border = Some(BorderSpec {
+                            style: parsed,
+                            ..BorderSpec::default()
+                        });
+                    }
+                }
+            }
             "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
                 let sides = match property {
                     "border-top" => [true, false, false, false],
@@ -2145,7 +2350,8 @@ fn apply_style_declarations(
                     _ => [true, true, true, true],
                 };
 
-                if value.to_ascii_lowercase().contains("none") || value.trim() == "0" {
+                let lower = value.to_ascii_lowercase();
+                if lower.contains("none") || lower.contains("hidden") || value.trim() == "0" {
                     if let Some(existing) = style.border.as_mut() {
                         for (side, enabled) in sides.iter().enumerate() {
                             if *enabled {
@@ -2205,6 +2411,37 @@ fn apply_style_declarations(
                     style.letter_spacing = length;
                 }
             }
+            "word-spacing" => {
+                if matches!(value.trim().to_ascii_lowercase().as_str(), "normal") {
+                    style.word_spacing = Length::default();
+                } else if let Some(length) =
+                    parse_length_resolved(value, parent_size, containing_width, style.px_scale)
+                {
+                    style.word_spacing = length;
+                }
+            }
+            "text-transform" => {
+                style.text_transform = match value.trim().to_ascii_lowercase().as_str() {
+                    "uppercase" => TextTransform::Uppercase,
+                    "lowercase" => TextTransform::Lowercase,
+                    "capitalize" => TextTransform::Capitalize,
+                    _ => TextTransform::None,
+                };
+            }
+            "overflow-wrap" | "word-wrap" => {
+                style.word_break = match value.trim().to_ascii_lowercase().as_str() {
+                    "break-word" => WordBreak::BreakWord,
+                    "anywhere" => WordBreak::Anywhere,
+                    _ => WordBreak::Normal,
+                };
+            }
+            "word-break" => {
+                style.word_break = match value.trim().to_ascii_lowercase().as_str() {
+                    "break-all" => WordBreak::BreakAll,
+                    "keep-all" => WordBreak::KeepAll,
+                    _ => WordBreak::Normal,
+                };
+            }
             "white-space" => {
                 style.white_space = match value.trim().to_ascii_lowercase().as_str() {
                     "pre" | "pre-line" => WhiteSpace::Pre,
@@ -2213,9 +2450,15 @@ fn apply_style_declarations(
                 };
             }
             "display" => {
-                style.display = match value.to_ascii_lowercase().as_str() {
+                style.display = match value.trim().to_ascii_lowercase().as_str() {
                     "none" => Display::None,
                     "block" => Display::Block,
+                    "inline-block" => Display::InlineBlock,
+                    "table" => Display::Table,
+                    "table-row" => Display::TableRow,
+                    "table-cell" => Display::TableCell,
+                    "table-header-group" => Display::TableHeaderGroup,
+                    "list-item" => Display::ListItem,
                     _ => Display::Inline,
                 };
             }
@@ -2314,8 +2557,23 @@ fn style_for_tag(tag: &str, parent: &Style) -> Style {
 
     match tag {
         "html" | "body" | "div" | "section" | "article" | "header" | "footer" | "main"
-        | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "li" => {
+        | "tbody" | "tfoot" => {
             style.display = Display::Block;
+        }
+        "table" => {
+            style.display = Display::Table;
+        }
+        "thead" => {
+            style.display = Display::TableHeaderGroup;
+        }
+        "tr" => {
+            style.display = Display::TableRow;
+        }
+        "td" | "th" => {
+            style.display = Display::TableCell;
+        }
+        "li" => {
+            style.display = Display::ListItem;
         }
         "ul" => {
             style.display = Display::Block;
@@ -2431,6 +2689,27 @@ fn parse_box_shorthand_resolved(
         4 => Some([values[0], values[1], values[2], values[3]]),
         _ => None,
     }
+}
+
+fn parse_page_break(input: &str) -> Option<PageBreak> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "always" | "page" | "left" | "right" => Some(PageBreak::Always),
+        "avoid" | "avoid-page" => Some(PageBreak::Avoid),
+        "auto" => Some(PageBreak::Auto),
+        _ => None,
+    }
+}
+
+fn parse_break_inside(input: &str) -> Option<BreakInside> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "avoid" | "avoid-page" => Some(BreakInside::Avoid),
+        "auto" | "page" => Some(BreakInside::Auto),
+        _ => None,
+    }
+}
+
+fn parse_positive_u32(input: &str) -> Option<u32> {
+    input.trim().parse::<u32>().ok().filter(|value| *value > 0)
 }
 
 fn parse_background_box(input: &str) -> Option<BackgroundBox> {
@@ -2707,6 +2986,17 @@ fn unit_to_points(
     }
 }
 
+fn parse_border_style(input: &str) -> Option<BorderStyle> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "none" | "hidden" => Some(BorderStyle::None),
+        "dotted" => Some(BorderStyle::Dotted),
+        "dashed" => Some(BorderStyle::Dashed),
+        "double" => Some(BorderStyle::Double),
+        "solid" => Some(BorderStyle::Solid),
+        _ => None,
+    }
+}
+
 fn parse_border(
     input: &str,
     sides: [bool; 4],
@@ -2717,21 +3007,24 @@ fn parse_border(
     let mut width = None;
     let mut color = parse_color(input.trim());
     let mut alpha = parse_color_alpha(input.trim()).unwrap_or(1.0);
+    let mut style = None;
 
-    if color.is_none() {
-        for token in input.split_whitespace() {
-            if width.is_none()
-                && let Some(length) = parse_length(token)
-            {
-                width = Some(length.resolve_with_size(font_size, containing_width, scale));
-                continue;
-            }
-            if color.is_none()
-                && let Some(parsed) = parse_color(token)
-            {
-                color = Some(parsed);
-                alpha = parse_color_alpha(token).unwrap_or(1.0);
-            }
+    for token in input.split_whitespace() {
+        if width.is_none()
+            && let Some(length) = parse_length(token)
+        {
+            width = Some(length.resolve_with_size(font_size, containing_width, scale));
+            continue;
+        }
+        if color.is_none()
+            && let Some(parsed) = parse_color(token)
+        {
+            color = Some(parsed);
+            alpha = parse_color_alpha(token).unwrap_or(1.0);
+            continue;
+        }
+        if let Some(parsed) = parse_border_style(token) {
+            style = Some(parsed);
         }
     }
 
@@ -2739,10 +3032,27 @@ fn parse_border(
         width: width.unwrap_or(1.0),
         color: color.unwrap_or([0.0, 0.0, 0.0]),
         alpha,
+        style: style.unwrap_or(BorderStyle::Solid),
         top: sides[0],
         right: sides[1],
         bottom: sides[2],
         left: sides[3],
+    })
+}
+
+fn parse_outline(
+    input: &str,
+    font_size: f32,
+    containing_width: f32,
+    scale: f32,
+) -> Option<OutlineSpec> {
+    let border = parse_border(input, [true; 4], font_size, containing_width, scale)?;
+    Some(OutlineSpec {
+        width: border.width,
+        color: border.color,
+        alpha: border.alpha,
+        style: border.style,
+        offset: 0.0,
     })
 }
 

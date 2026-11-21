@@ -14,6 +14,59 @@ fn writes_pdf_metadata() {
 }
 
 #[test]
+fn options_override_pdf_metadata() {
+    use std::path::Path;
+
+    let options = html2pdf_rs::Options::default()
+        .title("Judul Opsi")
+        .author("Penulis Opsi")
+        .subject("Subjek Opsi")
+        .keywords("satu, dua");
+    let pdf = html2pdf_rs::render_html_with_options(
+        "<title>Judul HTML</title><meta name=\"author\" content=\"Penulis HTML\"><p>Isi</p>",
+        Path::new("."),
+        &options,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(raw.contains("/Title (Judul Opsi)"));
+    assert!(raw.contains("/Author (Penulis Opsi)"));
+    assert!(raw.contains("/Subject (Subjek Opsi)"));
+    assert!(raw.contains("/Keywords (satu, dua)"));
+}
+
+#[test]
+fn decodes_windows_1252_html_bytes() {
+    let decoded =
+        html2pdf_rs::decode_html_bytes(b"<title>Caf\xe9 \x93Tes\x94</title>", "windows-1252");
+
+    assert_eq!(decoded, "<title>Caf\u{e9} \u{201c}Tes\u{201d}</title>");
+}
+
+#[test]
+fn decodes_ascii_with_replacement_for_high_bytes() {
+    let decoded = html2pdf_rs::decode_html_bytes(b"abc\xe9", "ASCII");
+
+    assert_eq!(decoded, "abc\u{fffd}");
+}
+
+#[test]
+fn no_javascript_option_omits_scripts() {
+    use std::path::Path;
+
+    let options = html2pdf_rs::Options::default().no_javascript();
+    let pdf = html2pdf_rs::render_html_with_options(
+        "<script>document.title='X'</script><script>app.alert('Y')</script><p>Isi</p>",
+        Path::new("."),
+        &options,
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert!(!raw.contains("/JavaScript"));
+    assert!(!raw.contains("/Names"));
+}
+
+#[test]
 fn loads_external_css_and_imports() {
     use std::fs;
 
@@ -93,12 +146,250 @@ fn applies_page_options() {
 
 #[test]
 fn paginates_long_content() {
-    let html = "<p>Baris</p>".repeat(80);
+    let html = format!(
+        "<style>@page {{ margin: 0; }} p {{ margin: 0; }}</style>{}",
+        "<p>Baris</p>".repeat(400)
+    );
     let pdf = html2pdf_rs::render_html(&html);
     let raw = String::from_utf8_lossy(&pdf);
     let pages = raw.matches("/Type /Page").count() - raw.matches("/Type /Pages").count();
 
     assert!(pages >= 5, "expected at least 5 pages, got {pages}");
+}
+
+fn page_count(raw: &str) -> usize {
+    raw.matches("/Type /Page").count() - raw.matches("/Type /Pages").count()
+}
+
+#[test]
+fn applies_page_break_before_always() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 100pt 100pt; margin: 5pt; }\
+         .row { font-size: 10pt; line-height: 1.2; }</style>\
+         <div class=\"row\">Satu</div>\
+         <div class=\"row\" style=\"page-break-before: always\">Dua</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(page_count(&raw), 2);
+}
+
+#[test]
+fn applies_break_before_alias() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 100pt 100pt; margin: 5pt; }\
+         .row { font-size: 10pt; line-height: 1.2; }</style>\
+         <div class=\"row\">Satu</div>\
+         <div class=\"row\" style=\"break-before: page\">Dua</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(page_count(&raw), 2);
+}
+
+#[test]
+fn applies_page_break_after_always() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 100pt 100pt; margin: 5pt; }\
+         .row { font-size: 10pt; line-height: 1.2; }</style>\
+         <div class=\"row\" style=\"page-break-after: always\">Satu</div>\
+         <div class=\"row\">Dua</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(page_count(&raw), 2);
+}
+
+#[test]
+fn ignores_forced_break_on_body() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 100pt 100pt; margin: 5pt; }</style>\
+         <body style=\"page-break-before: always\"><p>Isi</p></body>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(page_count(&raw), 1);
+}
+
+#[test]
+fn applies_page_break_before_to_table_row() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 100pt 100pt; margin: 5pt; }\
+         td { font-size: 10pt; line-height: 1.2; padding: 0; }</style>\
+         <table><tr><td>Satu</td></tr>\
+         <tr style=\"page-break-before: always\"><td>Dua</td></tr></table>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(page_count(&raw), 2);
+}
+
+#[test]
+fn honors_orphans_when_breaking() {
+    let lines = (1..=5)
+        .map(|value| format!("F{value}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let build = |orphans: u32| {
+        html2pdf_rs::render_html(&format!(
+            "<style>@page {{ size: 100pt 100pt; margin: 5pt; }}\
+             div {{ font-size: 10pt; line-height: 1.2; }}\
+             .keep {{ orphans: {orphans}; }}</style>\
+             <div>{lines}</div><div class=\"keep\">A<br>B<br>C<br>D</div>"
+        ))
+    };
+
+    let pdf_two = build(2);
+    let pdf_four = build(4);
+    let raw_two = String::from_utf8_lossy(&pdf_two);
+    let raw_four = String::from_utf8_lossy(&pdf_four);
+
+    assert_eq!(page_count(&raw_two), 2);
+    assert_eq!(page_count(&raw_four), 1);
+}
+
+#[test]
+fn honors_widows_when_breaking() {
+    let lines = (1..=30)
+        .map(|value| format!("L{value}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let build = |widows: u32| {
+        html2pdf_rs::render_html(&format!(
+            "<style>@page {{ size: 100pt 100pt; margin: 5pt; }}\
+             div {{ font-size: 10pt; line-height: 1.2; widows: {widows}; }}</style>\
+             <div>{lines}</div>"
+        ))
+    };
+
+    let pdf_one = build(1);
+    let pdf_ten = build(10);
+    let raw_one = String::from_utf8_lossy(&pdf_one);
+    let raw_ten = String::from_utf8_lossy(&pdf_ten);
+
+    assert!(
+        page_count(&raw_ten) < page_count(&raw_one),
+        "widows 10: {}, widows 1: {}",
+        page_count(&raw_ten),
+        page_count(&raw_one)
+    );
+}
+
+#[test]
+fn collapses_adjacent_vertical_margins() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 200pt 200pt; margin: 10pt; }\
+         div { font-size: 10pt; line-height: 1.2; }</style>\
+         <div style=\"margin-bottom: 30pt\">A</div>\
+         <div style=\"margin-top: 50pt\">B</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(matrices.len() >= 2);
+    let gap = matrices[0].1 - matrices[1].1;
+    assert!((gap - 62.0).abs() < 1.0, "expected 62pt gap, got {gap}");
+}
+
+#[test]
+fn collapses_parent_and_first_child_top_margins() {
+    let build = |nested: bool| {
+        let body = if nested {
+            "<div style=\"margin-top:40pt\"><div style=\"margin-top:20pt\">A</div></div>"
+        } else {
+            "<div style=\"margin-top:40pt\">A</div>"
+        };
+        html2pdf_rs::render_html(&format!(
+            "<style>@page {{ size: 200pt 200pt; margin: 10pt; }}\
+             div {{ font-size: 10pt; line-height: 1.2; margin: 0; }}</style>{body}"
+        ))
+    };
+
+    let flat = build(false);
+    let nested = build(true);
+    let flat_y = text_matrices(&String::from_utf8_lossy(&flat))[0].1;
+    let nested_y = text_matrices(&String::from_utf8_lossy(&nested))[0].1;
+
+    assert!((flat_y - nested_y).abs() < 0.5);
+}
+
+#[test]
+fn applies_page_margin_shorthand_per_side() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 200pt 200pt; margin: 10pt 20pt 30pt 40pt; }\
+         div { font-size: 10pt; line-height: 1.2; margin: 0; }</style><div>A</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(!matrices.is_empty());
+    assert!((matrices[0].0 - 40.0).abs() < 0.5);
+}
+
+#[test]
+fn applies_page_margin_longhands_per_side() {
+    let build = |top: u32, left: u32| {
+        html2pdf_rs::render_html(&format!(
+            "<style>@page {{ size: 200pt 200pt; margin: 0; margin-top: {top}pt; margin-left: {left}pt; }}\
+             div {{ font-size: 10pt; line-height: 1.2; margin: 0; }}</style><div>A</div>"
+        ))
+    };
+
+    let first = build(10, 20);
+    let second = build(40, 50);
+    let first_matrix = text_matrices(&String::from_utf8_lossy(&first))[0];
+    let second_matrix = text_matrices(&String::from_utf8_lossy(&second))[0];
+
+    assert!((second_matrix.0 - first_matrix.0 - 30.0).abs() < 0.5);
+    assert!((second_matrix.1 - first_matrix.1 + 30.0).abs() < 0.5);
+}
+
+#[test]
+fn renders_css_display_table_roles() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>@page { size: 200pt 200pt; margin: 10pt; }\
+         .table { display: table; }\
+         .header { display: table-header-group; }\
+         .row { display: table-row; }\
+         .cell { display: table-cell; }</style>\
+         <div class=\"table\">\
+           <div class=\"header\"><div class=\"row\"><div class=\"cell\">H</div></div></div>\
+           <div class=\"row\"><div class=\"cell\">A</div><div class=\"cell\">BBBBB</div></div>\
+         </div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(raw.contains("H"));
+    assert!(raw.contains("A"));
+    assert!(raw.contains("BBBBB"));
+    assert!(matrices.len() >= 3);
+    assert!((matrices[1].1 - matrices[2].1).abs() < 0.2);
+    assert!(matrices[2].0 - matrices[1].0 > 10.0);
+}
+
+#[test]
+fn renders_css_display_list_item() {
+    let pdf = html2pdf_rs::render_html(
+        "<style>.item { display: list-item; }</style><div class=\"item\">Item</div>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(raw.contains("Item"));
+    assert!(matrices.len() >= 2);
+}
+
+#[test]
+fn keeps_inline_block_content_on_the_same_line() {
+    let pdf = html2pdf_rs::render_html(
+        "<span>Sebelum</span><span style=\"display:inline-block\">Antara</span><span>Sesudah</span>",
+    );
+    let raw = String::from_utf8_lossy(&pdf);
+    let matrices = text_matrices(&raw);
+
+    assert!(matrices.len() >= 3);
+    assert!((matrices[0].1 - matrices[2].1).abs() < 0.2);
 }
 
 #[test]
@@ -181,6 +472,34 @@ fn draws_background_and_border() {
     assert!(raw.contains("1 0 0 rg"));
     assert!(raw.contains("0 0 1 rg"));
     assert!(raw.contains(" re"));
+}
+
+#[test]
+fn draws_non_solid_border_styles() {
+    let style = "border:2pt";
+    let text = "x".repeat(120);
+    let solid = html2pdf_rs::render_html(&format!("<div style=\"{style} solid\">{text}</div>"));
+    let dashed = html2pdf_rs::render_html(&format!("<div style=\"{style} dashed\">{text}</div>"));
+    let dotted = html2pdf_rs::render_html(&format!("<div style=\"{style} dotted\">{text}</div>"));
+    let double = html2pdf_rs::render_html(&format!("<div style=\"{style} double\">{text}</div>"));
+    let solid_rects = pdf_rects(&String::from_utf8_lossy(&solid)).len();
+
+    assert!(pdf_rects(&String::from_utf8_lossy(&dashed)).len() > solid_rects + 20);
+    assert!(pdf_rects(&String::from_utf8_lossy(&dotted)).len() > solid_rects + 20);
+    assert!(pdf_rects(&String::from_utf8_lossy(&double)).len() > solid_rects);
+}
+
+#[test]
+fn draws_outline_with_offset() {
+    let plain = html2pdf_rs::render_html("<div>x</div>");
+    let outlined = html2pdf_rs::render_html(
+        "<div style=\"outline:3pt dashed red;outline-offset:2pt\">x</div>",
+    );
+    let plain_rects = pdf_rects(&String::from_utf8_lossy(&plain)).len();
+    let outlined_raw = String::from_utf8_lossy(&outlined);
+
+    assert!(outlined_raw.contains("1 0 0 rg"));
+    assert!(pdf_rects(&outlined_raw).len() > plain_rects);
 }
 
 #[test]
@@ -401,6 +720,54 @@ fn parses_important_and_text_features() {
     assert!(raw.contains("1 0 0 rg"));
     assert!(!raw.contains("0 0 1 rg"));
     assert!(!raw.contains("0 0.5019608 0 rg"));
+}
+
+#[test]
+fn applies_text_transform_values() {
+    let uppercase =
+        html2pdf_rs::render_html("<p style=\"text-transform:uppercase\">halo dunia</p>");
+    let lowercase =
+        html2pdf_rs::render_html("<p style=\"text-transform:lowercase\">HALO DUNIA</p>");
+    let capitalize =
+        html2pdf_rs::render_html("<p style=\"text-transform:capitalize\">halo dunia</p>");
+
+    let uppercase = String::from_utf8_lossy(&uppercase);
+    let lowercase = String::from_utf8_lossy(&lowercase);
+    let capitalize = String::from_utf8_lossy(&capitalize);
+
+    assert!(uppercase.contains("HALO") && uppercase.contains("DUNIA"));
+    assert!(lowercase.contains("halo") && lowercase.contains("dunia"));
+    assert!(capitalize.contains("Halo") && capitalize.contains("Dunia"));
+}
+
+#[test]
+fn word_spacing_moves_following_words() {
+    let normal = html2pdf_rs::render_html("<p>A B</p>");
+    let spaced = html2pdf_rs::render_html("<p style=\"word-spacing:20pt\">A B</p>");
+    let normal_matrices = text_matrices(&String::from_utf8_lossy(&normal));
+    let spaced_matrices = text_matrices(&String::from_utf8_lossy(&spaced));
+
+    assert!(normal_matrices.len() >= 3);
+    assert!(spaced_matrices.len() >= 3);
+    assert!(spaced_matrices[2].0 - normal_matrices[2].0 > 10.0);
+}
+
+#[test]
+fn wraps_long_words_with_overflow_wrap_and_word_break() {
+    let long = "x".repeat(150);
+    let normal = html2pdf_rs::render_html(&format!("<div>{long}</div>"));
+    let break_word = html2pdf_rs::render_html(&format!(
+        "<div style=\"overflow-wrap:break-word\">{long}</div>"
+    ));
+    let break_all =
+        html2pdf_rs::render_html(&format!("<div style=\"word-break:break-all\">{long}</div>"));
+    let normal_matrices = text_matrices(&String::from_utf8_lossy(&normal));
+    let break_word_matrices = text_matrices(&String::from_utf8_lossy(&break_word));
+    let break_all_matrices = text_matrices(&String::from_utf8_lossy(&break_all));
+
+    assert!(normal_matrices.len() <= 1);
+    assert!(break_word_matrices.len() >= 2);
+    assert!(break_all_matrices.len() >= 2);
 }
 
 #[test]

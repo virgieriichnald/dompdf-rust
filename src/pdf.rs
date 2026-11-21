@@ -10,7 +10,7 @@ use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 use rand::RngCore;
 
 use crate::css::{
-    BackgroundAttachment, BackgroundBox, BackgroundRepeat, BackgroundSize, TextAlign,
+    BackgroundAttachment, BackgroundBox, BackgroundRepeat, BackgroundSize, BorderStyle, TextAlign,
 };
 use crate::layout::{
     Document, FontId, FontKind, FormControl, InlineItem, Line, Page, StructureRole,
@@ -239,6 +239,19 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         .iter()
         .map(|page| page.lines.len())
         .sum::<usize>();
+    let struct_line_roles = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines.iter())
+        .map(|line| line.struct_role)
+        .collect::<Vec<_>>();
+    let struct_list_id = if struct_line_roles.contains(&StructureRole::ListItem) {
+        let id = Ref::new(next_id);
+        next_id += 1;
+        Some(id)
+    } else {
+        None
+    };
     let struct_element_ids = (0..struct_line_count)
         .map(|_| {
             let id = Ref::new(next_id);
@@ -373,24 +386,50 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
                 .items(page_struct_ids[page_index].iter().copied());
         }
 
+        let struct_list_item_ids = struct_element_ids
+            .iter()
+            .zip(struct_line_roles.iter())
+            .filter(|(_, role)| **role == StructureRole::ListItem)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut document_children = Vec::new();
+        if let Some(id) = struct_list_id {
+            document_children.push(id);
+        }
+        document_children.extend(
+            struct_element_ids
+                .iter()
+                .zip(struct_line_roles.iter())
+                .filter(|(_, role)| **role != StructureRole::ListItem)
+                .map(|(id, _)| *id),
+        );
+        document_children.extend(struct_form_ids.iter().copied());
+
         let mut document_element = pdf.struct_element(struct_document_id);
         document_element
             .kind(StructRole::Document)
             .parent(struct_root_id);
-        document_element.children().items(
-            struct_element_ids
-                .iter()
-                .chain(struct_form_ids.iter())
-                .copied(),
-        );
+        document_element.children().items(document_children);
         document_element.finish();
+
+        if let Some(id) = struct_list_id {
+            let mut list_element = pdf.struct_element(id);
+            list_element.kind(StructRole::L).parent(struct_document_id);
+            list_element.children().items(struct_list_item_ids);
+            list_element.finish();
+        }
 
         for (page_index, page) in document.pages.iter().enumerate() {
             for (mcid, line) in page.lines.iter().enumerate() {
+                let parent = if line.struct_role == StructureRole::ListItem {
+                    struct_list_id.unwrap_or(struct_document_id)
+                } else {
+                    struct_document_id
+                };
                 let mut element = pdf.struct_element(page_struct_ids[page_index][mcid]);
                 element
                     .kind(struct_role_kind(line.struct_role))
-                    .parent(struct_document_id)
+                    .parent(parent)
                     .page(page_ids[page_index]);
                 element
                     .marked_content_child()
@@ -545,11 +584,12 @@ pub fn write_pdf(document: &Document) -> Vec<u8> {
         let mut form_widgets = Vec::new();
         let mut form_index = 0usize;
         for line in &page.lines {
-            let mut cursor = page.geometry.margin + line.left;
+            let mut cursor = page.geometry.margin_left + line.left;
             for item in &line.items {
                 if let InlineItem::Form(form) = item {
                     let top = line.top + (line.height - form.height) / 2.0;
-                    let bottom = page.geometry.height - page.geometry.margin - top - form.height;
+                    let bottom =
+                        page.geometry.height - page.geometry.margin_top - top - form.height;
                     let rect = Rect::new(cursor, bottom, cursor + form.width, bottom + form.height);
                     if let Some(&id) = form_ids.get(form_index) {
                         let (normal_ap, alternate_ap) = appearance_ids[form_index];
@@ -994,8 +1034,8 @@ fn write_link(
     link: &crate::layout::LinkRect,
     target: Option<(Ref, f32)>,
 ) {
-    let x = geometry.margin + line.left + link.x;
-    let top = geometry.height - geometry.margin - line.top;
+    let x = geometry.margin_left + line.left + link.x;
+    let top = geometry.height - geometry.margin_top - line.top;
     let bottom = top - line.height;
 
     let mut annotation = pdf.annotation(link_id);
@@ -1030,7 +1070,12 @@ fn font_resource(font: FontId) -> Vec<u8> {
 fn to_cids(text: &str, font: &crate::layout::EmbeddedFont) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.chars().count() * 2);
     for ch in text.chars() {
-        let glyph = font.glyphs.get(&ch).copied().unwrap_or(0);
+        let glyph = font
+            .glyphs
+            .get(&ch)
+            .or_else(|| font.glyphs.get(&'?'))
+            .copied()
+            .unwrap_or(0);
         bytes.extend_from_slice(&glyph.to_be_bytes());
     }
     bytes
@@ -1074,6 +1119,62 @@ fn collect_opacities(document: &Document) -> Vec<f32> {
 
 fn absolute_background_offset(value: f32, _available: f32) -> f32 {
     value
+}
+
+fn draw_border_side(
+    content: &mut Content,
+    x: f32,
+    y: f32,
+    length: f32,
+    thickness: f32,
+    style: BorderStyle,
+    horizontal: bool,
+) {
+    if length <= 0.0 || thickness <= 0.0 || style == BorderStyle::None {
+        return;
+    }
+    match style {
+        BorderStyle::Solid => {
+            if horizontal {
+                content.rect(x, y, length, thickness);
+            } else {
+                content.rect(x, y, thickness, length);
+            }
+        }
+        BorderStyle::Double => {
+            let strip = (thickness / 3.0).max(0.5);
+            if horizontal {
+                content.rect(x, y, length, strip);
+                content.rect(x, y + thickness - strip, length, strip);
+            } else {
+                content.rect(x, y, strip, length);
+                content.rect(x + thickness - strip, y, strip, length);
+            }
+        }
+        BorderStyle::Dotted | BorderStyle::Dashed => {
+            let segment = if style == BorderStyle::Dotted {
+                thickness
+            } else {
+                thickness * 2.0
+            };
+            let step = if style == BorderStyle::Dotted {
+                thickness * 2.0
+            } else {
+                thickness * 3.0
+            };
+            let mut position = 0.0;
+            while position < length {
+                let size = segment.min(length - position);
+                if horizontal {
+                    content.rect(x + position, y, size, thickness);
+                } else {
+                    content.rect(x, y + position, thickness, size);
+                }
+                position += step;
+            }
+        }
+        BorderStyle::None => {}
+    }
 }
 
 fn background_box_rect(
@@ -1208,7 +1309,10 @@ fn build_content(
     let mut content = Content::new();
     let width = page.geometry.width;
     let height = page.geometry.height;
-    let margin = page.geometry.margin;
+    let margin_top = page.geometry.margin_top;
+    let margin_right = page.geometry.margin_right;
+    let margin_bottom = page.geometry.margin_bottom;
+    let margin_left = page.geometry.margin_left;
     let base_font = if document.pdf_a || document.pdf_ua {
         document.fonts.first()
     } else {
@@ -1263,13 +1367,15 @@ fn build_content(
         }
 
         let x = match line.align {
-            TextAlign::Left | TextAlign::Justify => margin,
-            TextAlign::Center => margin + (width - 2.0 * margin - line.width) / 2.0,
-            TextAlign::Right => margin + width - 2.0 * margin - line.width,
+            TextAlign::Left | TextAlign::Justify => margin_left,
+            TextAlign::Center => {
+                margin_left + (width - margin_left - margin_right - line.width) / 2.0
+            }
+            TextAlign::Right => width - margin_right - line.width,
         } + line.left;
-        let line_y = height - margin - line.top - line.height;
+        let line_y = height - margin_top - line.top - line.height;
         let line_width = line.background_width.unwrap_or(line.width);
-        let border_left = margin + line.left;
+        let border_left = margin_left + line.left;
         let (clip_left, clip_bottom, clip_width, clip_height) = background_box_rect(
             line,
             line.background_clip,
@@ -1281,10 +1387,10 @@ fn build_content(
         let (origin_left, origin_bottom, origin_width, origin_height) =
             if line.background_attachment == BackgroundAttachment::Fixed {
                 (
-                    margin,
-                    margin,
-                    (width - 2.0 * margin).max(0.0),
-                    (height - 2.0 * margin).max(0.0),
+                    margin_left,
+                    margin_bottom,
+                    (width - margin_left - margin_right).max(0.0),
+                    (height - margin_top - margin_bottom).max(0.0),
                 )
             } else {
                 background_box_rect(
@@ -1454,7 +1560,7 @@ fn build_content(
                 content.set_stroke_rgb(color[0], color[1], color[2]);
                 rounded_rect_path(
                     &mut content,
-                    margin + line.left + width * 0.5,
+                    margin_left + line.left + width * 0.5,
                     line_y + width * 0.5,
                     line_width - width,
                     line.height - width,
@@ -1464,29 +1570,108 @@ fn build_content(
             }
 
             if border.top && !rounded {
-                content.rect(
-                    margin + line.left,
+                draw_border_side(
+                    &mut content,
+                    margin_left + line.left,
                     line_y + line.height - width,
                     line_width,
                     width,
+                    border.style,
+                    true,
                 );
             }
             if border.bottom && !rounded {
-                content.rect(margin + line.left, line_y, line_width, width);
+                draw_border_side(
+                    &mut content,
+                    margin_left + line.left,
+                    line_y,
+                    line_width,
+                    width,
+                    border.style,
+                    true,
+                );
             }
             if border.left && !rounded {
-                content.rect(margin + line.left, line_y, width, line.height);
+                draw_border_side(
+                    &mut content,
+                    margin_left + line.left,
+                    line_y,
+                    line.height,
+                    width,
+                    border.style,
+                    false,
+                );
             }
             if border.right && !rounded {
-                content.rect(
-                    margin + line.left + line_width - width,
+                draw_border_side(
+                    &mut content,
+                    margin_left + line.left + line_width - width,
                     line_y,
-                    width,
                     line.height,
+                    width,
+                    border.style,
+                    false,
                 );
             }
             content.fill_nonzero();
             if border_alpha.is_some() {
+                content.restore_state();
+            }
+        }
+
+        if let Some(outline) = line.outline {
+            let outline_width = outline.width;
+            let outline_alpha = state_for(outline.alpha);
+            if let Some(state) = outline_alpha {
+                content.save_state();
+                let name = format!("GS{}", state + 1);
+                content.op("gs").operand(Name(name.as_bytes()));
+            }
+            content
+                .set_fill_rgb(outline.color[0], outline.color[1], outline.color[2])
+                .set_line_width(outline_width);
+            let outline_x = margin_left + line.left - outline.offset;
+            let outline_y = line_y - outline.offset;
+            let outline_width_box = line_width + outline.offset * 2.0;
+            let outline_height = line.height + outline.offset * 2.0;
+            draw_border_side(
+                &mut content,
+                outline_x,
+                outline_y + outline_height - outline_width,
+                outline_width_box,
+                outline_width,
+                outline.style,
+                true,
+            );
+            draw_border_side(
+                &mut content,
+                outline_x,
+                outline_y,
+                outline_width_box,
+                outline_width,
+                outline.style,
+                true,
+            );
+            draw_border_side(
+                &mut content,
+                outline_x,
+                outline_y,
+                outline_height,
+                outline_width,
+                outline.style,
+                false,
+            );
+            draw_border_side(
+                &mut content,
+                outline_x + outline_width_box - outline_width,
+                outline_y,
+                outline_height,
+                outline_width,
+                outline.style,
+                false,
+            );
+            content.fill_nonzero();
+            if outline_alpha.is_some() {
                 content.restore_state();
             }
         }
@@ -1510,7 +1695,7 @@ fn build_content(
             if gaps == 0 {
                 0.0
             } else {
-                let available = width - 2.0 * margin - line.left;
+                let available = width - margin_left - margin_right - line.left;
                 (available - line.width) / gaps as f32
             }
         } else {
@@ -1585,7 +1770,7 @@ fn build_content(
                 }
                 InlineItem::Image(image) => {
                     let top = line.top + (line.height - image.height) / 2.0;
-                    let y = height - margin - top - image.height;
+                    let y = height - margin_top - top - image.height;
                     let name = format!("Im{}", image.image + 1);
 
                     content
@@ -1610,11 +1795,11 @@ fn build_content(
 
     content.begin_marked_content(Name(b"Artifact"));
     for line in &page.lines {
-        let mut cursor = margin + line.left;
+        let mut cursor = margin_left + line.left;
         for item in &line.items {
             if let InlineItem::Form(form) = item {
                 let top = line.top + (line.height - form.height) / 2.0;
-                let y = height - margin - top - form.height;
+                let y = height - margin_top - top - form.height;
                 let text = form.control.display_text();
                 let bytes = encode_font_text(&text, base_font);
                 content
@@ -1647,19 +1832,21 @@ fn build_content(
         if !bytes.is_empty() {
             let text_width = measure(&text, 9.0, base_font_id, &document.fonts);
             let (x, y) = match document.page_text_location {
-                crate::PageTextLocation::TopLeft => (margin, height - margin * 0.5),
-                crate::PageTextLocation::TopCenter => {
-                    ((width - text_width) / 2.0, height - margin * 0.5)
-                }
+                crate::PageTextLocation::TopLeft => (margin_left, height - margin_top * 0.5),
+                crate::PageTextLocation::TopCenter => (
+                    margin_left + (width - margin_left - margin_right - text_width) / 2.0,
+                    height - margin_top * 0.5,
+                ),
                 crate::PageTextLocation::TopRight => {
-                    (width - margin - text_width, height - margin * 0.5)
+                    (width - margin_right - text_width, height - margin_top * 0.5)
                 }
-                crate::PageTextLocation::BottomLeft => (margin, margin * 0.35),
-                crate::PageTextLocation::BottomCenter => {
-                    ((width - text_width) / 2.0, margin * 0.35)
-                }
+                crate::PageTextLocation::BottomLeft => (margin_left, margin_bottom * 0.35),
+                crate::PageTextLocation::BottomCenter => (
+                    margin_left + (width - margin_left - margin_right - text_width) / 2.0,
+                    margin_bottom * 0.35,
+                ),
                 crate::PageTextLocation::BottomRight => {
-                    (width - margin - text_width, margin * 0.35)
+                    (width - margin_right - text_width, margin_bottom * 0.35)
                 }
             };
             content.begin_marked_content(Name(b"Artifact"));
@@ -2237,10 +2424,24 @@ fn build_srgb_icc() -> Vec<u8> {
     output
 }
 
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn build_xmp(document: &Document) -> Vec<u8> {
-    let title = document.metadata.title.as_deref().unwrap_or("Document");
-    let author = document.metadata.author.as_deref().unwrap_or("");
-    let subject = document.metadata.subject.as_deref().unwrap_or("");
+    let title = xml_escape(document.metadata.title.as_deref().unwrap_or("Document"));
+    let author = xml_escape(document.metadata.author.as_deref().unwrap_or(""));
+    let subject = xml_escape(document.metadata.subject.as_deref().unwrap_or(""));
+    let keywords_part = document
+        .metadata
+        .keywords
+        .as_deref()
+        .map(|keywords| format!("<pdf:Keywords>{}</pdf:Keywords>", xml_escape(keywords)))
+        .unwrap_or_default();
     let creator = "html2pdf-rs";
     let pdfua_ns = if document.pdf_ua {
         " xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\""
@@ -2269,10 +2470,11 @@ fn build_xmp(document: &Document) -> Vec<u8> {
          <rdf:Description rdf:about=\"\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\" \
           xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" \
           xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"{pdfua_ns}>\
-          <pdf:Producer>{creator}</pdf:Producer>\
-          <xmp:CreatorTool>{creator}</xmp:CreatorTool>\
-          {pdfaid_part}\
-          {pdfua_part}\
+           <pdf:Producer>{creator}</pdf:Producer>\
+           <xmp:CreatorTool>{creator}</xmp:CreatorTool>\
+           {keywords_part}\
+           {pdfaid_part}\
+           {pdfua_part}\
          </rdf:Description>\
          </rdf:RDF></x:xmpmeta>\
          <?xpacket end=\"w\"?>"
